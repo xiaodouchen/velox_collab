@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
+#include "velox/experimental/cudf/exec/DecimalAggregationDevice.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
@@ -372,11 +373,11 @@ std::unique_ptr<cudf::column> singleDecimalAvgFromRawColumn(
     TypePtr const& resultType,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
+  auto const needsOverflowSafeSum =
+      inputCol.type().id() == cudf::type_id::DECIMAL128;
   std::unique_ptr<cudf::column> castedInput;
   inputCol = castDecimal64InputToDecimal128(inputCol, castedInput, stream);
-  auto const sumAgg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
-  auto sumScalar =
-      cudf::reduce(inputCol, *sumAgg, inputCol.type(), stream, get_temp_mr());
+  auto const tempMr = get_temp_mr();
   auto countAgg = cudf::make_count_aggregation<cudf::reduce_aggregation>(
       cudf::null_policy::EXCLUDE);
   auto countScalar = cudf::reduce(
@@ -384,10 +385,64 @@ std::unique_ptr<cudf::column> singleDecimalAvgFromRawColumn(
       *countAgg,
       cudf::data_type{cudf::type_id::INT64},
       stream,
-      get_temp_mr());
-  auto cols = makeSumCountColumns(*sumScalar, *countScalar, stream, mr);
-  return finalizeDecimalAverage(
-      std::move(cols.sum), std::move(cols.count), resultType, stream, mr);
+      tempMr);
+
+  auto sumAgg = cudf::make_sum_aggregation<cudf::reduce_aggregation>();
+  if (!needsOverflowSafeSum) {
+    auto sumScalar = cudf::reduce(
+        inputCol, *sumAgg, inputCol.type(), stream, tempMr);
+    auto cols = makeSumCountColumns(*sumScalar, *countScalar, stream, mr);
+    return finalizeDecimalAverage(
+        std::move(cols.sum), std::move(cols.count), resultType, stream, mr);
+  }
+
+  auto count = cudf::make_column_from_scalar(*countScalar, 1, stream, tempMr);
+  auto quotient = cudf::make_fixed_width_column(
+      inputCol.type(),
+      inputCol.size(),
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      tempMr);
+  auto remainder = cudf::make_fixed_width_column(
+      cudf::data_type{cudf::type_id::INT64},
+      inputCol.size(),
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      tempMr);
+  cudf_velox::detail::splitDecimalAverageInput(
+      inputCol,
+      count->view(),
+      quotient->mutable_view(),
+      remainder->mutable_view(),
+      stream);
+
+  auto quotientSumScalar = cudf::reduce(
+      quotient->view(), *sumAgg, quotient->type(), stream, tempMr);
+  auto remainderSumScalar = cudf::reduce(
+      remainder->view(), *sumAgg, remainder->type(), stream, tempMr);
+  auto quotientSum =
+      cudf::make_column_from_scalar(*quotientSumScalar, 1, stream, tempMr);
+  auto remainderSum =
+      cudf::make_column_from_scalar(*remainderSumScalar, 1, stream, tempMr);
+
+  auto average = cudf::make_fixed_width_column(
+      cudf_velox::veloxToCudfDataType(resultType),
+      1,
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  cudf_velox::detail::averageDecimalFromFloorParts(
+      quotientSum->view(),
+      remainderSum->view(),
+      count->view(),
+      average->mutable_view(),
+      stream);
+  auto [validityMask, nullCount] = cudf_velox::detail::buildStateValidityMask(
+      quotientSum->view(), count->view(), stream, mr);
+  if (nullCount > 0) {
+    average->set_null_mask(std::move(validityMask), nullCount);
+  }
+  return average;
 }
 
 std::unique_ptr<cudf::column> singleOrRawDecimalSumWithCast(
@@ -811,6 +866,14 @@ bool canReduceBeEvaluatedByCudf(
 
   // Check supported aggregation functions using reduce registry
   for (const auto& aggregate : aggregationNode.aggregates()) {
+    // Only the global raw-input path avoids DECIMAL128 SUM overflow. The
+    // serialized partial state does not track the overflow carry yet.
+    if (isLongDecimalAverage(aggregate) &&
+        getCompanionStep(aggregate.call->name(), step) !=
+            core::AggregationNode::Step::kSingle) {
+      return false;
+    }
+
     // Use step-aware validation that handles partial/final/intermediate steps
     if (!canReduceAggregationBeEvaluatedByCudf(
             *aggregate.call, step, aggregate.rawInputTypes, queryCtx)) {

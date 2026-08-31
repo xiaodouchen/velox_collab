@@ -44,6 +44,9 @@ core::AggregationNode::Step getCompanionStep(
 
 std::string getOriginalName(const std::string& kind);
 
+/// Returns true for AVG whose raw input uses DECIMAL128 storage.
+bool isLongDecimalAverage(const core::AggregationNode::Aggregate& aggregate);
+
 // Returns true if the cuDF aggregator for 'aggregateName' honors a FILTER mask.
 // Eligibility is declared at registration (maskSupportedAggregations) rather
 // than hardcoded here: sum/count/min/max opt in, so masked rows are excluded

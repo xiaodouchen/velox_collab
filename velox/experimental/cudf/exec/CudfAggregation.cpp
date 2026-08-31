@@ -97,6 +97,13 @@ std::string getOriginalName(const std::string& kind) {
   return kind;
 }
 
+bool isLongDecimalAverage(const core::AggregationNode::Aggregate& aggregate) {
+  return aggregate.rawInputTypes.size() == 1 &&
+      aggregate.rawInputTypes[0]->isLongDecimal() &&
+      getOriginalName(aggregate.call->name()) ==
+      CudfConfig::getInstance().functionNamePrefix + "avg";
+}
+
 bool aggregationSupportsMask(const std::string& aggregateName) {
   // Mask eligibility is declared at registration (see
   // maskSupportedAggregations() populated in

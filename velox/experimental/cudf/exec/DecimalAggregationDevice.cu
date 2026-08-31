@@ -137,6 +137,74 @@ struct AvgRoundFunctor {
   }
 };
 
+// Splits each valid DECIMAL128 input into floor-division parts.
+struct SplitAverageInputFunctor {
+  cuda::std::span<const __int128_t> values;
+  cuda::std::span<const int64_t> counts;
+  cuda::std::span<__int128_t> quotients;
+  cuda::std::span<int64_t> remainders;
+  cudf::bitmask_type const* nullMask;
+  cudf::size_type nullMaskOffset;
+
+  __device__ void operator()(cudf::size_type rowIndex) const {
+    auto count = counts[0];
+    if (count == 0 ||
+        (nullMask != nullptr &&
+         !cudf::bit_is_set(nullMask, rowIndex + nullMaskOffset))) {
+      quotients[rowIndex] = 0;
+      remainders[rowIndex] = 0;
+      return;
+    }
+
+    auto divisor = static_cast<__int128_t>(count);
+    auto quotient = values[rowIndex] / divisor;
+    auto remainder = values[rowIndex] % divisor;
+    // Convert C++ truncating division to floor division so every remainder is
+    // in [0, count).
+    if (remainder < 0) {
+      --quotient;
+      remainder += divisor;
+    }
+    quotients[rowIndex] = quotient;
+    remainders[rowIndex] = static_cast<int64_t>(remainder);
+  }
+};
+
+// Reconstructs and rounds an exact average from separately reduced parts.
+struct AverageFromPartsFunctor {
+  cuda::std::span<const __int128_t> quotientSums;
+  cuda::std::span<const int64_t> remainderSums;
+  cuda::std::span<const int64_t> counts;
+  cuda::std::span<__int128_t> output;
+
+  __device__ void operator()(cudf::size_type rowIndex) const {
+    auto count = counts[rowIndex];
+    if (count == 0) {
+      output[rowIndex] = 0;
+      return;
+    }
+
+    auto divisor = static_cast<__int128_t>(count);
+    auto remainder = static_cast<__int128_t>(remainderSums[rowIndex]);
+    auto quotientCarry = remainder / divisor;
+    remainder %= divisor;
+    if (remainder < 0) {
+      --quotientCarry;
+      remainder += divisor;
+    }
+    auto floorAverage = quotientSums[rowIndex] + quotientCarry;
+    // Round a positive tie upward and keep a negative tie at the more-negative
+    // floor value to implement HALF_UP rounding. The exact floor average, not
+    // the sign of a wrapped partial sum, determines the rounding direction so
+    // overflow results remain independent of input order.
+    auto threshold = floorAverage >= 0 ? count / 2 + count % 2 : count / 2 + 1;
+    if (remainder >= static_cast<__int128_t>(threshold)) {
+      ++floorAverage;
+    }
+    output[rowIndex] = floorAverage;
+  }
+};
+
 template <typename BuildOp>
 void launchDeviceFor(
     cudf::size_type size,
@@ -363,6 +431,86 @@ void averageRoundDecimalSum(
   cudf::type_dispatcher<cudf::dispatch_storage_type>(
       cudf::data_type{sumType},
       averageRoundDecimalSumKernel{sumCol, counts, outView, numRows, stream});
+}
+
+void splitDecimalAverageInput(
+    cudf::column_view inputColumn,
+    cudf::column_view countColumn,
+    cudf::mutable_column_view quotientColumn,
+    cudf::mutable_column_view remainderColumn,
+    rmm::cuda_stream_view stream) {
+  CUDF_EXPECTS(
+      inputColumn.type().id() == cudf::type_id::DECIMAL128,
+      "Decimal average split requires DECIMAL128 input");
+  CUDF_EXPECTS(
+      countColumn.type().id() == cudf::type_id::INT64 &&
+          countColumn.size() == 1 && countColumn.null_count() == 0,
+      "Decimal average split requires one non-null INT64 count");
+  CUDF_EXPECTS(
+      quotientColumn.type() == inputColumn.type() &&
+          quotientColumn.size() == inputColumn.size(),
+      "Decimal average quotient must match the input");
+  CUDF_EXPECTS(
+      remainderColumn.type().id() == cudf::type_id::INT64 &&
+          remainderColumn.size() == inputColumn.size(),
+      "Decimal average remainder must be an input-sized INT64 column");
+
+  auto const numRows = inputColumn.size();
+  auto const spanSize = static_cast<size_t>(numRows);
+  launchDeviceFor(
+      numRows,
+      [&] {
+        return SplitAverageInputFunctor{
+            cuda::std::span<const __int128_t>{
+                inputColumn.data<__int128_t>(), spanSize},
+            cuda::std::span<const int64_t>{countColumn.data<int64_t>(), 1},
+            cuda::std::span<__int128_t>{
+                quotientColumn.data<__int128_t>(), spanSize},
+            cuda::std::span<int64_t>{remainderColumn.data<int64_t>(), spanSize},
+            inputColumn.null_mask(),
+            inputColumn.offset()};
+      },
+      stream);
+}
+
+void averageDecimalFromFloorParts(
+    cudf::column_view quotientSumColumn,
+    cudf::column_view remainderSumColumn,
+    cudf::column_view countColumn,
+    cudf::mutable_column_view outputColumn,
+    rmm::cuda_stream_view stream) {
+  CUDF_EXPECTS(
+      quotientSumColumn.type().id() == cudf::type_id::DECIMAL128 &&
+          quotientSumColumn.size() == 1,
+      "Decimal average requires one DECIMAL128 quotient sum");
+  CUDF_EXPECTS(
+      remainderSumColumn.type().id() == cudf::type_id::INT64 &&
+          remainderSumColumn.size() == 1,
+      "Decimal average requires one INT64 remainder sum");
+  CUDF_EXPECTS(
+      countColumn.type().id() == cudf::type_id::INT64 &&
+          countColumn.size() == 1 && countColumn.null_count() == 0,
+      "Decimal average requires one non-null INT64 count");
+  CUDF_EXPECTS(
+      outputColumn.type() == quotientSumColumn.type() &&
+          outputColumn.size() == 1,
+      "Decimal average output must match the quotient sum");
+  CUDF_EXPECTS(
+      quotientSumColumn.null_count() == remainderSumColumn.null_count(),
+      "Decimal average quotient and remainder validity must match");
+
+  launchDeviceFor(
+      1,
+      [&] {
+        return AverageFromPartsFunctor{
+            cuda::std::span<const __int128_t>{
+                quotientSumColumn.data<__int128_t>(), 1},
+            cuda::std::span<const int64_t>{
+                remainderSumColumn.data<int64_t>(), 1},
+            cuda::std::span<const int64_t>{countColumn.data<int64_t>(), 1},
+            cuda::std::span<__int128_t>{outputColumn.data<__int128_t>(), 1}};
+      },
+      stream);
 }
 
 void packDecimalSumState(

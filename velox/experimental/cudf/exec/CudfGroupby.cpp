@@ -907,6 +907,12 @@ bool canGroupbyBeEvaluatedByCudf(
 
   // Check supported aggregation functions using step-aware aggregation registry
   for (const auto& aggregate : aggregationNode.aggregates()) {
+    // Grouped DECIMAL128 AVG still reduces a raw or serialized DECIMAL128 SUM,
+    // whose overflow carry is not tracked by the current GPU state.
+    if (isLongDecimalAverage(aggregate)) {
+      return false;
+    }
+
     // Use step-aware validation that handles partial/final/intermediate steps
     if (!canGroupbyAggregationBeEvaluatedByCudf(
             *aggregate.call, step, aggregate.rawInputTypes, queryCtx)) {

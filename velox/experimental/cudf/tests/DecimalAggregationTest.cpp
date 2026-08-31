@@ -188,10 +188,10 @@ std::vector<cudf::bitmask_type> copyNullMask(
     const cudf::column_view& view,
     rmm::cuda_stream_view stream) {
   auto numWords = cudf::num_bitmask_words(view.size());
-  std::vector<cudf::bitmask_type> host(numWords, 0);
   if (!view.nullable() || numWords == 0) {
-    return host;
+    return {};
   }
+  std::vector<cudf::bitmask_type> host(numWords, 0);
   auto status = cudaMemcpyAsync(
       host.data(),
       view.null_mask(),
@@ -498,6 +498,115 @@ TEST_F(CudfDecimalTest, decimalAvgGlobalSingleDecimal64Overflow) {
   auto result =
       facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool());
   facebook::velox::test::assertEqualVectors(expected, result);
+}
+
+TEST_F(CudfDecimalTest, decimalAvgGlobalSingleDecimal128Overflow) {
+  const auto assertAverage = [&](const RowVectorPtr& input,
+                                 const VectorPtr& expectedValue) {
+    auto plan = exec::test::PlanBuilder()
+                    .values({input})
+                    .singleAggregation({}, {"avg(d) AS a"})
+                    .planNode();
+    auto expected = makeRowVector({"a"}, {expectedValue});
+
+    auto result =
+        facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(
+            pool());
+    facebook::velox::test::assertEqualVectors(expected, result);
+  };
+
+  for (const auto value : {
+           DecimalUtil::kLongDecimalMax,
+           DecimalUtil::kLongDecimalMin,
+       }) {
+    SCOPED_TRACE(value > 0 ? "positive overflow" : "negative overflow");
+    auto input = makeRowVector(
+        {"d"},
+        {makeNullableFlatVector<int128_t>(
+            {value, std::nullopt, value}, DECIMAL(38, 0))});
+    assertAverage(input, makeFlatVector<int128_t>({value}, DECIMAL(38, 0)));
+  }
+
+  {
+    SCOPED_TRACE("all null");
+    auto input = makeRowVector(
+        {"d"},
+        {makeNullableFlatVector<int128_t>(
+            {std::nullopt, std::nullopt}, DECIMAL(38, 0))});
+    assertAverage(
+        input,
+        makeNullableFlatVector<int128_t>({std::nullopt}, DECIMAL(38, 0)));
+  }
+
+  const auto maxValue = DecimalUtil::kLongDecimalMax;
+  const auto expectedValue = -(maxValue / 4 + 1);
+  const std::vector<std::vector<int128_t>> inputOrders = {
+      {-maxValue, -maxValue, maxValue, 1},
+      {maxValue, 1, -maxValue, -maxValue},
+  };
+  for (size_t i = 0; i < inputOrders.size(); ++i) {
+    SCOPED_TRACE(i);
+    auto input = makeRowVector(
+        {"d"}, {makeFlatVector<int128_t>(inputOrders[i], DECIMAL(38, 0))});
+    assertAverage(
+        input, makeFlatVector<int128_t>({expectedValue}, DECIMAL(38, 0)));
+  }
+}
+
+TEST_F(CudfDecimalTest, decimalAvgGlobalMultistepDecimal128Fallback) {
+  auto input = makeRowVector(
+      {"d"},
+      {makeFlatVector<int128_t>(
+          {DecimalUtil::kLongDecimalMax, DecimalUtil::kLongDecimalMax},
+          DECIMAL(38, 0))});
+
+  {
+    SCOPED_TRACE("partial-final");
+    auto plan = exec::test::PlanBuilder()
+                    .values({input})
+                    .partialAggregation({}, {"avg(d) AS a"})
+                    .finalAggregation()
+                    .planNode();
+    VELOX_ASSERT_THROW(
+        facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(
+            pool()),
+        "Replacement with cuDF operator failed");
+  }
+
+  {
+    SCOPED_TRACE("with intermediate");
+    auto plan = exec::test::PlanBuilder()
+                    .values({input})
+                    .partialAggregation({}, {"avg(d) AS a"})
+                    .intermediateAggregation()
+                    .finalAggregation()
+                    .planNode();
+    VELOX_ASSERT_THROW(
+        facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(
+            pool()),
+        "Replacement with cuDF operator failed");
+  }
+}
+
+TEST_F(CudfDecimalTest, decimalAvgGroupbySingleDecimal128Fallback) {
+  auto input = makeRowVector(
+      {"k", "d"},
+      {
+          makeFlatVector<int32_t>({1, 1, 2, 2}),
+          makeFlatVector<int128_t>(
+              {DecimalUtil::kLongDecimalMax,
+               DecimalUtil::kLongDecimalMax,
+               DecimalUtil::kLongDecimalMin,
+               DecimalUtil::kLongDecimalMin},
+              DECIMAL(38, 0)),
+      });
+  auto plan = exec::test::PlanBuilder()
+                  .values({input})
+                  .singleAggregation({"k"}, {"avg(d) AS a"})
+                  .planNode();
+  VELOX_ASSERT_THROW(
+      facebook::velox::exec::test::AssertQueryBuilder(plan).copyResults(pool()),
+      "Replacement with cuDF operator failed");
 }
 
 TEST_F(CudfDecimalTest, decimalAvgGroupbySingleDecimal64Overflow) {

@@ -117,6 +117,30 @@ void averageRoundDecimalSum(
     cudf::size_type numRows,
     rmm::cuda_stream_view stream);
 
+/// Splits each DECIMAL128 value x by the one-row non-null count n into
+/// floor-division parts x = quotient * n + remainder, where
+/// 0 <= remainder < n. Quotients use DECIMAL128 and remainders use INT64. Null
+/// inputs and a zero count write zero; the caller applies validity separately.
+void splitDecimalAverageInput(
+    cudf::column_view inputColumn,
+    cudf::column_view countColumn,
+    cudf::mutable_column_view quotientColumn,
+    cudf::mutable_column_view remainderColumn,
+    rmm::cuda_stream_view stream);
+
+/// Combines one-row sums produced by splitDecimalAverageInput, then applies
+/// HALF_UP rounding to the exact average. The quotient and output are
+/// DECIMAL128; the remainder sum and count are INT64. Signed remainder sums are
+/// normalized to floor form before rounding. Quotient and remainder validity
+/// must match. Since n fits cudf::size_type, remainders produced by the split
+/// sum to less than n squared and fit INT64.
+void averageDecimalFromFloorParts(
+    cudf::column_view quotientSumColumn,
+    cudf::column_view remainderSumColumn,
+    cudf::column_view countColumn,
+    cudf::mutable_column_view outputColumn,
+    rmm::cuda_stream_view stream);
+
 /**
  * Builds a null mask for rows where sum and count are both valid and count is
  * non-zero, for serializing state or finalizing averages.
