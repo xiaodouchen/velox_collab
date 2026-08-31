@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/DecimalAggregationHostOps.h"
 #include "velox/experimental/cudf/exec/DecimalAggregationState.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -35,6 +36,8 @@
 #include <cudf/utilities/default_stream.hpp>
 
 #include <cuda_runtime_api.h>
+
+#include <gmock/gmock.h>
 
 #include <cstdlib>
 #include <limits>
@@ -1542,6 +1545,45 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal128) {
       EXPECT_EQ(outAvg[i], avgUnscaled(sums[i], counts[i]));
     }
   }
+}
+
+TEST_F(CudfDecimalTest, decimalComputeAverageToNarrowerStorage) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  auto sumColumn =
+      makeDecimalColumn<__int128_t>({100, -125, 300}, 2, nullptr, stream);
+  auto countColumn = makeInt64Column({6, 6, 0}, nullptr, stream);
+
+  auto averageColumn = detail::computeDecimalAverage(
+      sumColumn->view(),
+      countColumn->view(),
+      cudf::data_type{cudf::type_id::DECIMAL64, -2},
+      stream,
+      mr);
+
+  EXPECT_EQ(
+      averageColumn->type(), (cudf::data_type{cudf::type_id::DECIMAL64, -2}));
+  EXPECT_THAT(
+      copyColumnData<int64_t>(averageColumn->view(), stream),
+      testing::ElementsAre(17, -21, 0));
+  EXPECT_FALSE(isValidAt(copyNullMask(averageColumn->view(), stream), 2));
+}
+
+TEST_F(CudfDecimalTest, decimalFinalizeAveragePreservesScaleConversion) {
+  auto stream = cudf::get_default_stream();
+  auto mr = cudf::get_current_device_resource_ref();
+  auto sumColumn =
+      makeDecimalColumn<__int128_t>({125, -125}, 2, nullptr, stream);
+  auto countColumn = makeInt64Column({1, 1}, nullptr, stream);
+
+  auto averageColumn = finalizeDecimalAverage(
+      std::move(sumColumn), std::move(countColumn), DECIMAL(10, 3), stream, mr);
+
+  EXPECT_EQ(
+      averageColumn->type(), (cudf::data_type{cudf::type_id::DECIMAL64, -3}));
+  EXPECT_THAT(
+      copyColumnData<int64_t>(averageColumn->view(), stream),
+      testing::ElementsAre(1'250, -1'250));
 }
 
 TEST_F(CudfDecimalTest, decimalComputeAverageDecimal64MostNegativeSum) {

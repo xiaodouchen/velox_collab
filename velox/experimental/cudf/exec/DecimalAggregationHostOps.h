@@ -86,10 +86,10 @@ std::unique_ptr<cudf::column> serializeDecimalPartialOrIntermediateState(
     rmm::device_async_resource_ref mr);
 
 /**
- * Normalizes the count column to INT64, computes a per-row decimal average
- * from intermediate sum/count (delegates to computeDecimalAverage), then casts
- * the result to the Velox result type when its cuDF decimal encoding differs
- * from the average column's type.
+ * Normalizes the count column to INT64, then computes a per-row decimal average
+ * directly in the Velox result storage type when its scale matches the sum.
+ * AVG signatures whose result scale differs from the sum retain the historical
+ * decimal cast.
  *
  * @param sum intermediate sum column (DECIMAL64 or DECIMAL128).
  * @param count intermediate count column.

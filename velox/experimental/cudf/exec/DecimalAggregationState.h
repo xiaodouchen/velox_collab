@@ -68,23 +68,34 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 
-/**
- * Finalizes AVG from intermediate SUM state: divides each sum by its count on
- * device with decimal-specific rounding (see averageRoundDecimalSum),
- * producing a column of the same decimal type as the sum. Rows are null where
- * buildStateValidityMask marks them invalid (null sum/count or zero count),
- * matching serializeDecimalSumState.
- *
- * @param sumCol per-row partial sums (DECIMAL64 or DECIMAL128).
- * @param countCol per-row INT64 partial row counts.
- * @param stream CUDA stream for device work.
- * @param mr memory resource for allocated columns.
- * @return per-row decimal average column.
- */
+/// Finalizes AVG from intermediate SUM state: divides each sum by its count on
+/// device with decimal-specific rounding (see averageRoundDecimalSum),
+/// producing a column of the same decimal type as the sum. Rows are null where
+/// buildStateValidityMask marks them invalid (null sum/count or zero count),
+/// matching serializeDecimalSumState.
+///
+/// @param sumColumn per-row partial sums (DECIMAL64 or DECIMAL128).
+/// @param countColumn per-row INT64 partial row counts.
+/// @param stream CUDA stream for device work.
+/// @param mr memory resource for allocated columns.
+/// @return per-row decimal average column.
 std::unique_ptr<cudf::column> computeDecimalAverage(
-    const cudf::column_view& sumCol,
-    const cudf::column_view& countCol,
+    const cudf::column_view& sumColumn,
+    const cudf::column_view& countColumn,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
+
+namespace detail {
+
+// Finalizes AVG directly into a DECIMAL64 or DECIMAL128 result column whose
+// scale matches the sum column.
+std::unique_ptr<cudf::column> computeDecimalAverage(
+    const cudf::column_view& sumColumn,
+    const cudf::column_view& countColumn,
+    cudf::data_type resultType,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+} // namespace detail
 
 } // namespace facebook::velox::cudf_velox

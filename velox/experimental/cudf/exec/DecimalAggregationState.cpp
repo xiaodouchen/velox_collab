@@ -228,49 +228,67 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
       std::move(nullMask));
 }
 
-std::unique_ptr<cudf::column> computeDecimalAverage(
-    const cudf::column_view& sumCol,
-    const cudf::column_view& countCol,
+std::unique_ptr<cudf::column> detail::computeDecimalAverage(
+    const cudf::column_view& sumColumn,
+    const cudf::column_view& countColumn,
+    cudf::data_type resultType,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
   VELOX_CHECK(
-      countCol.type().id() == cudf::type_id::INT64,
+      countColumn.type().id() == cudf::type_id::INT64,
       "Decimal average requires INT64 count column (type is {})",
-      cudf::type_to_name(countCol.type()));
+      cudf::type_to_name(countColumn.type()));
   VELOX_CHECK(
-      sumCol.type().id() == cudf::type_id::DECIMAL64 ||
-          sumCol.type().id() == cudf::type_id::DECIMAL128,
+      sumColumn.type().id() == cudf::type_id::DECIMAL64 ||
+          sumColumn.type().id() == cudf::type_id::DECIMAL128,
       "Decimal average requires DECIMAL64 or DECIMAL128 sum column (type is {})",
-      cudf::type_to_name(sumCol.type()));
+      cudf::type_to_name(sumColumn.type()));
+  VELOX_CHECK(
+      resultType.id() == cudf::type_id::DECIMAL64 ||
+          resultType.id() == cudf::type_id::DECIMAL128,
+      "Decimal average requires DECIMAL64 or DECIMAL128 result type (type is {})",
+      cudf::type_to_name(resultType));
+  VELOX_CHECK(
+      sumColumn.type().scale() == resultType.scale(),
+      "Decimal average result scale must match sum scale");
   VELOX_CHECK_EQ(
-      sumCol.size(),
-      countCol.size(),
+      sumColumn.size(),
+      countColumn.size(),
       "Decimal average requires sum and count to be same size (sum size is {}, count size is {})",
-      sumCol.size(),
-      countCol.size());
+      sumColumn.size(),
+      countColumn.size());
 
-  auto numRows = sumCol.size();
-  auto out = cudf::make_fixed_width_column(
-      sumCol.type(), numRows, cudf::mask_state::UNALLOCATED, stream, mr);
+  auto numRows = sumColumn.size();
+  auto output = cudf::make_fixed_width_column(
+      resultType, numRows, cudf::mask_state::UNALLOCATED, stream, mr);
 
   if (numRows > 0) {
     auto const rowCount = static_cast<int32_t>(numRows);
-    const auto sumType = sumCol.type().id();
+    const auto sumType = sumColumn.type().id();
     detail::averageRoundDecimalSum(
         sumType,
-        sumCol,
-        countCol.data<int64_t>(),
-        out->mutable_view(),
+        sumColumn,
+        countColumn.data<int64_t>(),
+        output->mutable_view(),
         rowCount,
         stream);
   }
 
   auto [nullMask, nullCount] =
-      detail::buildStateValidityMask(sumCol, countCol, stream, mr);
+      detail::buildStateValidityMask(sumColumn, countColumn, stream, mr);
   if (nullCount > 0) {
-    out->set_null_mask(std::move(nullMask), nullCount);
+    output->set_null_mask(std::move(nullMask), nullCount);
   }
-  return out;
+  return output;
+}
+
+std::unique_ptr<cudf::column> computeDecimalAverage(
+    const cudf::column_view& sumColumn,
+    const cudf::column_view& countColumn,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  return detail::computeDecimalAverage(
+      sumColumn, countColumn, sumColumn.type(), stream, mr);
 }
 
 } // namespace facebook::velox::cudf_velox

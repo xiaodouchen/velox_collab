@@ -101,11 +101,11 @@ void unpackDecimalSumState(
  * Per-row half-up integer divide of sum by count; count == 0 writes zero
  * (validity is applied separately).
  *
- * @param sumType DECIMAL64 or DECIMAL128; selects sum storage width via
- *        cudf::type_dispatcher<cudf::dispatch_storage_type>.
+ * @param sumType DECIMAL64 or DECIMAL128; selects sum storage width.
  * @param sumCol per-row sums.
  * @param counts per-row counts.
- * @param outView output per-row averages.
+ * @param outView output per-row DECIMAL64 or DECIMAL128 averages. Its storage
+ *        type participates in double dispatch and its scale must match sumCol.
  * @param numRows number of rows.
  * @param stream CUDA stream for the launch.
  */

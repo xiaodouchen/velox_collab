@@ -77,12 +77,16 @@ std::unique_ptr<cudf::column> finalizeDecimalAverage(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
   count = castCountColumnToInt64(std::move(count), stream);
-  auto avgCol = computeDecimalAverage(sum->view(), count->view(), stream, mr);
-  auto const cudfOutType = veloxToCudfDataType(resultType);
-  if (avgCol->type() != cudfOutType) {
-    avgCol = cudf::cast(avgCol->view(), cudfOutType, stream, mr);
+  auto const cudfOutputType = veloxToCudfDataType(resultType);
+  if (sum->type().scale() == cudfOutputType.scale()) {
+    return detail::computeDecimalAverage(
+        sum->view(), count->view(), cudfOutputType, stream, mr);
   }
-  return avgCol;
+
+  // Preserve rescaling for AVG signatures whose result scale differs from the
+  // input scale. Same-scale results take the direct path above.
+  auto average = computeDecimalAverage(sum->view(), count->view(), stream, mr);
+  return cudf::cast(average->view(), cudfOutputType, stream, mr);
 }
 
 } // namespace facebook::velox::cudf_velox

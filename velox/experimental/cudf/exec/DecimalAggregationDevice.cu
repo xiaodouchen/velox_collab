@@ -115,25 +115,29 @@ struct UnpackStateFunctor {
 };
 
 // Half-up sum/count divide for AVG.
-template <typename SumT>
+template <typename SumT, typename ResultT>
 struct AvgRoundFunctor {
   cuda::std::span<const SumT> sums;
   cuda::std::span<const int64_t> counts;
-  cuda::std::span<SumT> out;
+  cuda::std::span<ResultT> output;
 
-  __device__ void operator()(cudf::size_type idx) const {
-    auto count = counts[idx];
+  __device__ void operator()(cudf::size_type rowIndex) const {
+    auto count = counts[rowIndex];
     if (count == 0) {
-      out[idx] = SumT{0};
+      output[rowIndex] = ResultT{0};
       return;
     }
-    auto sum = sums[idx];
-    using U = cuda::std::make_unsigned_t<SumT>;
-    U absSum = sum < 0 ? -static_cast<U>(sum) : static_cast<U>(sum);
-    U half = static_cast<U>(count / 2);
-    U rounded = (absSum + half) / static_cast<U>(count);
-    // Use `U{0} - rounded` below to avoid signed overflow
-    out[idx] = static_cast<SumT>(sum < 0 ? U{0} - rounded : rounded);
+    auto sum = sums[rowIndex];
+    using UnsignedSum = cuda::std::make_unsigned_t<SumT>;
+    UnsignedSum absoluteSum = sum < 0 ? -static_cast<UnsignedSum>(sum)
+                                      : static_cast<UnsignedSum>(sum);
+    UnsignedSum halfCount = static_cast<UnsignedSum>(count / 2);
+    UnsignedSum roundedMagnitude =
+        (absoluteSum + halfCount) / static_cast<UnsignedSum>(count);
+    // Subtract from zero in the unsigned domain to avoid signed overflow.
+    auto signedRounded = static_cast<SumT>(
+        sum < 0 ? UnsignedSum{0} - roundedMagnitude : roundedMagnitude);
+    output[rowIndex] = static_cast<ResultT>(signedRounded);
   }
 };
 
@@ -205,6 +209,10 @@ template <typename T>
 concept DecimalSumStorageType =
     std::same_as<T, int64_t> || std::same_as<T, __int128_t>;
 
+template <typename SumT, typename ResultT>
+concept ValidDecimalAverageStorageTypes =
+    DecimalSumStorageType<SumT> && DecimalSumStorageType<ResultT>;
+
 template <typename SumT, typename OffsetT>
 concept ValidDecimalPackStorageTypes =
     DecimalSumStorageType<SumT> && OffsetStorageType<OffsetT>;
@@ -274,25 +282,25 @@ struct averageRoundDecimalSumKernel {
   cudf::size_type numRows;
   rmm::cuda_stream_view stream;
 
-  template <typename SumT>
-    requires DecimalSumStorageType<SumT>
+  template <typename SumT, typename ResultT>
+    requires ValidDecimalAverageStorageTypes<SumT, ResultT>
   void operator()() const {
     auto const n = static_cast<size_t>(numRows);
     launchDeviceFor(
         numRows,
         [&] {
-          return AvgRoundFunctor<SumT>{
+          return AvgRoundFunctor<SumT, ResultT>{
               cuda::std::span<const SumT>{sumCol.data<SumT>(), n},
               cuda::std::span<const int64_t>{counts, n},
-              cuda::std::span<SumT>{outView.data<SumT>(), n}};
+              cuda::std::span<ResultT>{outView.data<ResultT>(), n}};
         },
         stream);
   }
 
-  template <typename SumT>
-    requires(!DecimalSumStorageType<SumT>)
+  template <typename SumT, typename ResultT>
+    requires(!ValidDecimalAverageStorageTypes<SumT, ResultT>)
   void operator()() const {
-    CUDF_FAIL("Invalid sum type for decimal average");
+    CUDF_FAIL("Invalid sum or result type for decimal average");
   }
 };
 
@@ -360,8 +368,9 @@ void averageRoundDecimalSum(
     cudf::mutable_column_view outView,
     cudf::size_type numRows,
     rmm::cuda_stream_view stream) {
-  cudf::type_dispatcher<cudf::dispatch_storage_type>(
+  cudf::double_type_dispatcher<cudf::dispatch_storage_type>(
       cudf::data_type{sumType},
+      outView.type(),
       averageRoundDecimalSumKernel{sumCol, counts, outView, numRows, stream});
 }
 
