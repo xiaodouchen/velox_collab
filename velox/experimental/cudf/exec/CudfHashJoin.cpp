@@ -417,6 +417,9 @@ CudfHashJoinProbe::CudfHashJoinProbe(
   }
   outputLayout_ = CudfJoinOutputLayout(
       probeType_, buildType_, outputType, joinNode_->joinType());
+  if (!joinNode_->isRightJoin() && !joinNode_->isFullJoin()) {
+    identityProjections_ = outputLayout_.probeProjections();
+  }
 
   if (CudfConfig::getInstance().debugEnabled) {
     for (std::size_t i = 0; i < outputLayout_.probeColumnIndices().size();

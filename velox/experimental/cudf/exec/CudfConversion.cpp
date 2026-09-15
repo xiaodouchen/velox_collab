@@ -87,6 +87,9 @@ CudfFromVelox::CudfFromVelox(
           std::nullopt),
       timestampTimeZone_(driverCtx->queryConfig().get<std::string>(
           facebook::velox::core::QueryConfig::kSessionTimezone)) {
+  for (column_index_t channel = 0; channel < outputType_->size(); ++channel) {
+    identityProjections_.emplace_back(channel, channel);
+  }
   auto parentId = planNodeId.substr(0, planNodeId.find("-from-velox"));
   stats_.withWLock([&](auto& stats) {
     stats.setStatSplitter(
@@ -204,6 +207,9 @@ CudfToVelox::CudfToVelox(
           NvtxMethodFlag::kAll,
           std::nullopt,
           std::nullopt) {
+  for (column_index_t channel = 0; channel < outputType_->size(); ++channel) {
+    identityProjections_.emplace_back(channel, channel);
+  }
   auto parentId = planNodeId.substr(0, planNodeId.find("-to-velox"));
   stats_.withWLock([&](auto& stats) {
     stats.setStatSplitter(
