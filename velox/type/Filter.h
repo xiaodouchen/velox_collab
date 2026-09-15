@@ -18,6 +18,7 @@
 #include <folly/Range.h>
 #include <folly/container/F14Set.h>
 #include <xsimd/xsimd.hpp>
+#include <span>
 #include "velox/common/EnumDeclare.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/SimdUtil.h"
@@ -1338,6 +1339,11 @@ class BigintValuesUsingBloomFilter final : public Filter {
 
   static std::unique_ptr<Filter> create(const folly::dynamic& obj);
 
+  /// Creates a filter from blocks encoded by SplitBlockBloomFilter.
+  static std::unique_ptr<BigintValuesUsingBloomFilter> createFromBlocks(
+      std::vector<SplitBlockBloomFilter::Block> blocks,
+      bool nullAllowed);
+
   bool testingEquals(const Filter& other) const override;
 
   std::unique_ptr<Filter> mergeWith(const Filter* other) const override;
@@ -1352,6 +1358,11 @@ class BigintValuesUsingBloomFilter final : public Filter {
 
   int64_t blocksByteSize() const {
     return blocks_.size() * sizeof(SplitBlockBloomFilter::Block);
+  }
+
+  /// Returns the immutable blocks used by SplitBlockBloomFilter.
+  std::span<const SplitBlockBloomFilter::Block> blocks() const {
+    return blocks_;
   }
 
  private:

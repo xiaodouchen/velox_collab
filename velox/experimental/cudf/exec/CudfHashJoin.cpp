@@ -23,8 +23,10 @@
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/AstExpressionUtils.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+#include "velox/experimental/cudf/filter/CudfSplitBlockBloomFilter.h"
 
 #include "velox/core/PlanNode.h"
+#include "velox/exec/HashProbe.h"
 #include "velox/exec/Task.h" // NOLINT(misc-unused-headers)
 #include "velox/exec/VectorHasher.h"
 #include "velox/expression/ExprOptimizer.h"
@@ -49,6 +51,7 @@
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
 
+#include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
@@ -542,6 +545,42 @@ std::shared_ptr<common::Filter> CudfHashJoinProbe::makeIntegerDynamicFilter(
     std::sort(values.begin(), values.end());
     values.erase(std::unique(values.begin(), values.end()), values.end());
     auto filter = common::createBigintValues(values, false);
+    return std::shared_ptr<common::Filter>(std::move(filter));
+  }
+
+  const auto maxBloomFilterBytes = operatorCtx_->driverCtx()
+                                       ->queryConfig()
+                                       .hashProbeBloomFilterPushdownMaxSize();
+  const auto numBloomBlocks = static_cast<std::size_t>(
+      common::BigintValuesUsingBloomFilter::numBlocks(numBuildValues));
+  const auto bloomFilterBytes =
+      numBloomBlocks * sizeof(SplitBlockBloomFilter::Block);
+  if (maxBloomFilterBytes > 0 && bloomFilterBytes <= maxBloomFilterBytes) {
+    rmm::device_buffer deviceBlocks(bloomFilterBytes, stream, get_temp_mr());
+    CUDF_CUDA_TRY(cudaMemsetAsync(
+        deviceBlocks.data(), 0, bloomFilterBytes, stream.get()));
+    for (const auto& keyColumn : keyColumns) {
+      insertSplitBlockBloomFilter(
+          keyColumn,
+          static_cast<uint32_t*>(deviceBlocks.data()),
+          numBloomBlocks,
+          sizeof(SplitBlockBloomFilter::Block) / sizeof(uint32_t),
+          stream);
+    }
+
+    std::vector<SplitBlockBloomFilter::Block> blocks(numBloomBlocks);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        blocks.data(),
+        deviceBlocks.data(),
+        bloomFilterBytes,
+        cudaMemcpyDeviceToHost,
+        stream.get()));
+    stream.sync();
+    addRuntimeStat(
+        std::string(exec::HashProbe::kBloomFilterSize),
+        RuntimeCounter(bloomFilterBytes));
+    auto filter = common::BigintValuesUsingBloomFilter::createFromBlocks(
+        std::move(blocks), false);
     return std::shared_ptr<common::Filter>(std::move(filter));
   }
 
