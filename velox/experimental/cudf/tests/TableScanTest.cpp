@@ -38,6 +38,7 @@
 #include "velox/exec/Exchange.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/TableScan.h"
+#include "velox/exec/VectorHasher.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/LocalExchangeSource.h"
@@ -49,6 +50,10 @@
 #include <cudf/io/parquet.hpp>
 
 #include <fmt/ranges.h>
+#include <folly/ScopeGuard.h>
+
+#include <atomic>
+#include <functional>
 
 using namespace facebook::velox;
 using namespace facebook::velox::common::testutil;
@@ -787,6 +792,86 @@ TEST_F(TableScanTest, remainingFilterExtraction) {
   ASSERT_NE(it, scanStats.customStats.end());
   EXPECT_EQ(it->second.sum, 0)
       << "Expected no remaining filter time when filter is fully extracted";
+}
+
+TEST_F(TableScanTest, integerDynamicFilterFromHashJoin) {
+  constexpr vector_size_t kNumBuildRows{
+      ::facebook::velox::exec::VectorHasher::kMaxDistinct + 1};
+  auto probeType = ROW({{"c0", INTEGER()}, {"c1", BIGINT()}});
+  auto probe = makeRowVector(
+      {makeFlatVector<int32_t>(1'000, folly::identity),
+       makeFlatVector<int64_t>(
+           1'000, [](auto row) { return static_cast<int64_t>(row) * 10; })});
+  auto sparseBuildKey = makeFlatVector<int64_t>(kNumBuildRows, [](auto row) {
+    return static_cast<int64_t>(100 + row) * 10;
+  });
+  for (vector_size_t row = 100; row < kNumBuildRows; ++row) {
+    sparseBuildKey->setNull(row, true);
+  }
+  auto build = makeRowVector(
+      {makeFlatVector<int32_t>(
+           kNumBuildRows, [](auto row) { return 100 + row; }),
+       sparseBuildKey});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), probe);
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto buildSide = PlanBuilder(planNodeIdGenerator, pool_.get())
+                       .values({build})
+                       .project({"c0 AS u_key0", "c1 AS u_key1"})
+                       .planNode();
+  core::PlanNodeId scanId;
+  core::PlanNodeId joinId;
+  auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                  .startTableScan()
+                  .connectorId(kCudfHiveConnectorId)
+                  .outputType(probeType)
+                  .dataColumns(probeType)
+                  .assignments(
+                      facebook::velox::exec::test::HiveConnectorTestBase::
+                          allRegularColumns(probeType))
+                  .endTableScan()
+                  .capturePlanNodeId(scanId)
+                  .project({"c1 AS key1", "c0 AS key0"})
+                  .hashJoin(
+                      {"key0", "key1"},
+                      {"u_key0", "u_key1"},
+                      buildSide,
+                      "",
+                      {"key0", "key1"},
+                      core::JoinType::kInner)
+                  .capturePlanNodeId(joinId)
+                  .planNode();
+
+  std::atomic<int32_t> numFiltersBuilt{0};
+  const bool testValuesWereEnabled = common::testutil::TestValue::enabled();
+  common::testutil::TestValue::enable();
+  SCOPE_EXIT {
+    if (!testValuesWereEnabled) {
+      common::testutil::TestValue::disable();
+    }
+  };
+  common::testutil::ScopedTestValue filterBuildCounter(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::makeIntegerDynamicFilter",
+      std::function<void(void*)>([&](void*) { ++numFiltersBuilt; }));
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                  .maxDrivers(4)
+                  .splits(scanId, makeCudfHiveConnectorSplits({filePath}))
+                  .assertResults(
+                      "SELECT t.c0, t.c1 FROM t JOIN u "
+                      "ON t.c0 = u.c0 AND t.c1 = u.c1");
+  const auto stats = toPlanStats(task->taskStats());
+  EXPECT_GE(stats.at(joinId).customStats.at("dynamicFiltersProduced").sum, 2);
+  EXPECT_GE(stats.at(scanId).customStats.at("dynamicFiltersAccepted").sum, 2);
+  EXPECT_EQ(stats.at(scanId).outputRows, 100);
+  EXPECT_EQ(
+      stats.at(scanId).dynamicFilterStats.producerNodeIds,
+      std::unordered_set<core::PlanNodeId>{joinId});
+#ifndef NDEBUG
+  EXPECT_EQ(numFiltersBuilt, 2);
+#endif
 }
 
 TEST_F(TableScanTest, decimalSubfieldFilter) {

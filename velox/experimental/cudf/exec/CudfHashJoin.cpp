@@ -26,6 +26,7 @@
 
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Task.h" // NOLINT(misc-unused-headers)
+#include "velox/exec/VectorHasher.h"
 #include "velox/expression/ExprOptimizer.h"
 #include "velox/type/TypeUtil.h"
 
@@ -396,10 +397,13 @@ CudfHashJoinProbe::CudfHashJoinProbe(
 
   auto const probeTableNumColumns = probeType_->size();
   leftKeyIndices_ = std::vector<cudf::size_type>(leftKeys.size());
+  probeKeyChannels_.reserve(leftKeys.size());
   for (size_t i = 0; i < leftKeyIndices_.size(); i++) {
     leftKeyIndices_[i] = static_cast<cudf::size_type>(
         probeType_->getChildIdx(leftKeys[i]->name()));
     VELOX_CHECK_LT(leftKeyIndices_[i], probeTableNumColumns);
+    probeKeyChannels_.push_back(
+        static_cast<column_index_t>(leftKeyIndices_[i]));
   }
   auto const buildTableNumColumns = buildType_->size();
   rightKeyIndices_ = std::vector<cudf::size_type>(rightKeys.size());
@@ -440,6 +444,173 @@ void CudfHashJoinProbe::waitForBuildReady(cuda::stream_ref stream) {
   if (buildReadyEvent_ != nullptr) {
     buildReadyEvent_->waitOn(stream);
   }
+}
+
+bool CudfHashJoinProbe::canPushdownDynamicFilter() const {
+  if (!joinNode_->isInnerJoin() ||
+      !operatorCtx_->driverCtx()
+           ->queryConfig()
+           .hashProbeDynamicFilterPushdownEnabled()) {
+    return false;
+  }
+
+  const auto supportedChannels =
+      operatorCtx_->driverCtx()->driver->canPushdownFilters(
+          this, probeKeyChannels_);
+  for (std::size_t keyIndex = 0; keyIndex < probeKeyChannels_.size();
+       ++keyIndex) {
+    if (supportedChannels.contains(probeKeyChannels_[keyIndex]) &&
+        supportsIntegerDynamicFilter(keyIndex)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool CudfHashJoinProbe::supportsIntegerDynamicFilter(
+    std::size_t keyIndex) const {
+  VELOX_CHECK_LT(keyIndex, rightKeyIndices_.size());
+  const auto& keyType = buildType_->childAt(rightKeyIndices_[keyIndex]);
+  return keyType == TINYINT() || keyType == SMALLINT() ||
+      keyType == INTEGER() || keyType == BIGINT();
+}
+
+std::shared_ptr<common::Filter> CudfHashJoinProbe::makeIntegerDynamicFilter(
+    column_index_t keyIndex,
+    cuda::stream_ref stream) {
+  VELOX_CHECK_LT(keyIndex, rightKeyIndices_.size());
+  VELOX_CHECK(hashObject_.has_value());
+  common::testutil::TestValue::adjust(
+      "facebook::velox::cudf_velox::CudfHashJoinProbe::makeIntegerDynamicFilter",
+      this);
+
+  if (!supportsIntegerDynamicFilter(keyIndex)) {
+    return nullptr;
+  }
+
+  const auto& buildTables = hashObject_->first;
+  uint64_t numBuildValues{0};
+  std::vector<cudf::column_view> keyColumns;
+  keyColumns.reserve(buildTables.size());
+  for (const auto& table : buildTables) {
+    const auto keyColumn = table->view().column(rightKeyIndices_[keyIndex]);
+    const auto nullCount = keyColumn.null_count();
+    numBuildValues +=
+        nullCount >= 0 ? keyColumn.size() - nullCount : keyColumn.size();
+    keyColumns.push_back(keyColumn);
+  }
+  if (numBuildValues == 0) {
+    return nullptr;
+  }
+
+  if (numBuildValues <= exec::VectorHasher::kMaxDistinct) {
+    std::vector<int64_t> values;
+    values.reserve(numBuildValues);
+    std::vector<std::unique_ptr<cudf::table>> nonNullTables;
+    std::vector<std::unique_ptr<cudf::column>> int64Columns;
+    nonNullTables.reserve(keyColumns.size());
+    int64Columns.reserve(keyColumns.size());
+    for (const auto& keyColumn : keyColumns) {
+      auto nonNull = cudf::drop_nulls(
+          cudf::table_view{{keyColumn}},
+          std::vector<cudf::size_type>{0},
+          stream,
+          get_temp_mr());
+      if (nonNull->num_rows() == 0) {
+        continue;
+      }
+      auto int64Column = cudf::cast(
+          nonNull->view().column(0),
+          cudf::data_type{cudf::type_id::INT64},
+          stream,
+          get_temp_mr());
+      const auto offset = values.size();
+      values.resize(offset + int64Column->size());
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          values.data() + offset,
+          int64Column->view().data<int64_t>(),
+          int64Column->size() * sizeof(int64_t),
+          cudaMemcpyDeviceToHost,
+          stream.get()));
+      nonNullTables.push_back(std::move(nonNull));
+      int64Columns.push_back(std::move(int64Column));
+    }
+    stream.sync();
+    if (values.empty()) {
+      return nullptr;
+    }
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    auto filter = common::createBigintValues(values, false);
+    return std::shared_ptr<common::Filter>(std::move(filter));
+  }
+
+  std::optional<int64_t> lower;
+  std::optional<int64_t> upper;
+  for (const auto& keyColumn : keyColumns) {
+    auto int64Column = cudf::cast(
+        keyColumn,
+        cudf::data_type{cudf::type_id::INT64},
+        stream,
+        get_temp_mr());
+    auto [minimum, maximum] =
+        cudf::minmax(int64Column->view(), stream, get_temp_mr());
+    if (!minimum->is_valid(stream)) {
+      continue;
+    }
+    VELOX_CHECK(maximum->is_valid(stream));
+    const auto batchLower =
+        static_cast<cudf::numeric_scalar<int64_t>*>(minimum.get())
+            ->value(stream);
+    const auto batchUpper =
+        static_cast<cudf::numeric_scalar<int64_t>*>(maximum.get())
+            ->value(stream);
+    lower = lower.has_value() ? std::min(*lower, batchLower) : batchLower;
+    upper = upper.has_value() ? std::max(*upper, batchUpper) : batchUpper;
+  }
+  if (!lower.has_value()) {
+    return nullptr;
+  }
+  return std::make_shared<common::BigintRange>(*lower, *upper, false);
+}
+
+std::vector<CudfHashJoinProbe*> CudfHashJoinProbe::findPeerOperators() {
+  auto operators = operatorCtx_->task()->findPeerOperators(
+      operatorCtx_->driverCtx()->pipelineId, this);
+  std::vector<CudfHashJoinProbe*> peers;
+  peers.reserve(operators.size());
+  for (auto* op : operators) {
+    if (auto* peer = dynamic_cast<CudfHashJoinProbe*>(op)) {
+      peers.push_back(peer);
+    }
+  }
+  return peers;
+}
+
+void CudfHashJoinProbe::pushdownDynamicFilters() {
+  if (!canPushdownDynamicFilter()) {
+    return;
+  }
+  auto* driver = operatorCtx_->driverCtx()->driver;
+  auto stream = cudfGlobalStreamPool().get_stream();
+  waitForBuildReady(stream);
+  driver->pushdownFilters(
+      this,
+      probeKeyChannels_,
+      [&](column_index_t keyIndex, std::shared_ptr<common::Filter>& filter) {
+        if (dynamicFiltersProducedOnKeys_.contains(keyIndex)) {
+          return true;
+        }
+        filter = makeIntegerDynamicFilter(keyIndex, stream);
+        if (!filter) {
+          return false;
+        }
+        dynamicFiltersProducedOnKeys_.insert(keyIndex);
+        for (auto* peer : findPeerOperators()) {
+          peer->dynamicFiltersProducedOnKeys_.insert(keyIndex);
+        }
+        return true;
+      });
 }
 
 void CudfHashJoinProbe::initialize() {
@@ -526,6 +697,9 @@ void CudfHashJoinProbe::initialize() {
 bool CudfHashJoinProbe::needsInput() const {
   if (joinNode_->isRightSemiFilterJoin()) {
     return !noMoreInput_;
+  }
+  if (!hashObject_ && canPushdownDynamicFilter()) {
+    return false;
   }
   return !noMoreInput_ && !finished_ && input_ == nullptr;
 }
@@ -2269,6 +2443,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   hashObject_ = std::move(hashObject);
   buildStream_ = cudfJoinBridge->getBuildStream();
   buildReadyEvent_ = cudfJoinBridge->getBuildReadyEvent();
+  pushdownDynamicFilters();
 
   // Lazy initialize matched flags only when build side is done
   if (joinNode_->isRightJoin() || joinNode_->isFullJoin()) {
