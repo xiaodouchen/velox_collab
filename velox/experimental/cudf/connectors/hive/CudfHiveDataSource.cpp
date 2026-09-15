@@ -36,7 +36,16 @@
 #include "velox/core/QueryCtx.h"
 #include "velox/expression/ExprOptimizer.h"
 
+#include <cudf/column/column_factories.hpp>
+#include <cudf/replace.hpp>
+#include <cudf/scalar/scalar.hpp>
+#include <cudf/search.hpp>
 #include <cudf/stream_compaction.hpp>
+#include <cudf/transform.hpp>
+#include <cudf/unary.hpp>
+#include <cudf/utilities/error.hpp>
+
+#include <algorithm>
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -287,6 +296,65 @@ void CudfHiveDataSource::setFromDataSource(std::unique_ptr<DataSource> source) {
   ioStats_ = std::move(preparedSource->ioStats_);
 }
 
+void CudfHiveDataSource::addDynamicFilter(
+    column_index_t outputChannel,
+    const std::shared_ptr<common::Filter>& filter) {
+  VELOX_CHECK_NOT_NULL(filter);
+  VELOX_CHECK_LT(outputChannel, outputType_->size());
+
+  const auto& columnType = outputType_->childAt(outputChannel);
+  const bool isSupportedInteger = columnType == TINYINT() ||
+      columnType == SMALLINT() || columnType == INTEGER() ||
+      columnType == BIGINT();
+  const auto kind = filter->kind();
+  const bool isIntegerValues =
+      kind == common::FilterKind::kBigintValuesUsingHashTable ||
+      kind == common::FilterKind::kBigintValuesUsingBitmask;
+  auto field = common::Subfield::create(readColumnNames_[outputChannel]);
+
+  if (!isSupportedInteger) {
+    dynamicIntegerFilters_.erase(outputChannel);
+    dynamicFilters_.erase(*field);
+  } else if (isIntegerValues) {
+    std::vector<int64_t> values;
+    if (kind == common::FilterKind::kBigintValuesUsingHashTable) {
+      values =
+          static_cast<const common::BigintValuesUsingHashTable*>(filter.get())
+              ->values();
+    } else {
+      values =
+          static_cast<const common::BigintValuesUsingBitmask*>(filter.get())
+              ->values();
+    }
+    std::sort(values.begin(), values.end());
+    values.erase(std::unique(values.begin(), values.end()), values.end());
+    dynamicIntegerFilters_.insert_or_assign(
+        outputChannel,
+        DynamicIntegerFilter{std::move(values), filter->testNull(), nullptr});
+    dynamicFilters_.erase(*field);
+  } else if (kind == common::FilterKind::kBigintRange) {
+    dynamicIntegerFilters_.erase(outputChannel);
+    dynamicFilters_.insert_or_assign(field->clone(), filter->clone());
+  } else {
+    // Ignoring an unsupported filter preserves correctness. The exact join
+    // still runs after this optional scan reduction.
+    dynamicIntegerFilters_.erase(outputChannel);
+    dynamicFilters_.erase(*field);
+  }
+
+  dynamicFilterExpr_ = nullptr;
+  dynamicFilterTree_.reset();
+  dynamicFilterScalars_.clear();
+  if (!dynamicFilters_.empty()) {
+    dynamicFilterTree_ = std::make_unique<cudf::ast::tree>();
+    dynamicFilterExpr_ = &createAstFromSubfieldFilters(
+        dynamicFilters_,
+        *dynamicFilterTree_,
+        dynamicFilterScalars_,
+        getTableRowType());
+  }
+}
+
 std::optional<RowVectorPtr> CudfHiveDataSource::next(
     uint64_t size,
     velox::ContinueFuture& /* future */) {
@@ -299,6 +367,60 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   }
   auto cudfTable = std::move(chunkOpt.value());
   auto stream = cudfSplitReader_->stream();
+
+  if ((dynamicFilterExpr_ || !dynamicIntegerFilters_.empty()) &&
+      cudfTable->num_rows() > 0) {
+    if (dynamicFilterExpr_) {
+      auto mask = cudf::compute_column(
+          cudfTable->view(), *dynamicFilterExpr_, stream, get_temp_mr());
+      cudfTable = cudf::apply_retention_mask(
+          *cudfTable, mask->view(), stream, get_output_mr());
+    }
+
+    for (auto& [channel, dynamicFilter] : dynamicIntegerFilters_) {
+      if (cudfTable->num_rows() == 0) {
+        break;
+      }
+      if (!dynamicFilter.deviceValues) {
+        dynamicFilter.deviceValues = cudf::make_fixed_width_column(
+            cudf::data_type{cudf::type_id::INT64},
+            dynamicFilter.values.size(),
+            cudf::mask_state::UNALLOCATED,
+            stream,
+            get_temp_mr());
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+            dynamicFilter.deviceValues->mutable_view().data<int64_t>(),
+            dynamicFilter.values.data(),
+            dynamicFilter.values.size() * sizeof(int64_t),
+            cudaMemcpyHostToDevice,
+            stream.get()));
+      }
+
+      auto inputColumn = cudfTable->view().column(channel);
+      std::unique_ptr<cudf::column> int64Input;
+      if (inputColumn.type().id() != cudf::type_id::INT64) {
+        int64Input = cudf::cast(
+            inputColumn,
+            cudf::data_type{cudf::type_id::INT64},
+            stream,
+            get_temp_mr());
+        inputColumn = int64Input->view();
+      }
+      auto mask = cudf::contains(
+          dynamicFilter.deviceValues->view(),
+          inputColumn,
+          stream,
+          get_temp_mr());
+      if (dynamicFilter.nullAllowed && mask->view().has_nulls()) {
+        const auto trueScalar =
+            cudf::numeric_scalar<bool>(true, true, stream, get_temp_mr());
+        mask = cudf::replace_nulls(
+            mask->view(), trueScalar, stream, get_temp_mr());
+      }
+      cudfTable = cudf::apply_retention_mask(
+          *cudfTable, mask->view(), stream, get_output_mr());
+    }
+  }
 
   uint64_t filterTimeUs{0};
   if (optimizedRemainingFilter_) {
