@@ -34,6 +34,8 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column.hpp>
 
+#include <rmm/device_buffer.hpp>
+
 #include <mutex>
 #include <string_view>
 #include <unordered_map>
@@ -166,12 +168,24 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
     std::unique_ptr<cudf::column> deviceValues;
   };
 
+  // Holds a community-format Bloom filter and its lazily copied device blocks.
+  struct DynamicBloomFilter {
+    // Owns the CPU blocks for the lifetime of the data source.
+    std::shared_ptr<const common::BigintValuesUsingBloomFilter> filter;
+
+    // Avoids copying the same blocks for every input batch.
+    std::unique_ptr<rmm::device_buffer> deviceBlocks;
+  };
+
   // Keeps Range filters in the existing AST representation.
   common::SubfieldFilters dynamicFilters_;
 
   // Keeps exact integer filters indexed by their output channel.
   std::unordered_map<column_index_t, DynamicIntegerFilter>
       dynamicIntegerFilters_;
+
+  // Keeps Bloom filters indexed by their output channel.
+  std::unordered_map<column_index_t, DynamicBloomFilter> dynamicBloomFilters_;
 
   // Owns all AST nodes referenced by 'dynamicFilterExpr_'.
   std::unique_ptr<cudf::ast::tree> dynamicFilterTree_;

@@ -19,7 +19,9 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
+#include "velox/experimental/cudf/filter/CudfSplitBlockBloomFilter.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
 
 #include "velox/common/base/Fs.h"
@@ -48,7 +50,13 @@
 #include "velox/type/Type.h"
 #include "velox/type/tests/SubfieldFiltersBuilder.h"
 
+#include <cudf/copying.hpp>
 #include <cudf/io/parquet.hpp>
+#include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
+
+#include <rmm/device_buffer.hpp>
 
 #include <fmt/ranges.h>
 #include <folly/ScopeGuard.h>
@@ -56,7 +64,9 @@
 #include <folly/synchronization/Latch.h>
 
 #include <atomic>
+#include <cstring>
 #include <functional>
+#include <limits>
 
 using namespace facebook::velox;
 using namespace facebook::velox::common::testutil;
@@ -1077,6 +1087,162 @@ TEST_F(TableScanTest, integerDynamicFilterFromHashJoin) {
 #ifndef NDEBUG
   EXPECT_EQ(numFiltersBuilt, 2);
 #endif
+}
+
+TEST_F(TableScanTest, splitBlockBloomFilterUsesVeloxFormat) {
+  auto stream = cudf::get_default_stream();
+  auto memoryResource = cudf::get_current_device_resource_ref();
+  auto values = makeFlatVector<int64_t>(259, [](auto row) {
+    return (static_cast<int64_t>(row) - 129) * 4'294'967'297LL;
+  });
+  for (vector_size_t row = 0; row < values->size(); row += 17) {
+    values->setNull(row, true);
+  }
+  values->set(1, std::numeric_limits<int64_t>::min());
+  values->setNull(1, false);
+  values->set(257, std::numeric_limits<int64_t>::max());
+  values->setNull(257, false);
+  auto input = makeRowVector({values});
+  auto table =
+      with_arrow::toCudfTable(input, pool_.get(), stream, memoryResource);
+  const auto slices = cudf::slice(table->view().column(0), {1, 258}, stream);
+  ASSERT_EQ(slices.size(), 1);
+  const auto slice = slices.front();
+
+  common::BigintValuesUsingBloomFilter cpuFilter(slice.size(), false);
+  for (vector_size_t row = 1; row < 258; row += 2) {
+    if (!values->isNullAt(row)) {
+      cpuFilter.insert(values->valueAt(row));
+    }
+  }
+  const auto cpuBlocks = cpuFilter.blocks();
+  rmm::device_buffer deviceBlocks(
+      cpuFilter.blocksByteSize(), stream, memoryResource);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      deviceBlocks.data(),
+      cpuBlocks.data(),
+      cpuFilter.blocksByteSize(),
+      cudaMemcpyHostToDevice,
+      stream.get()));
+  auto checkMask = [&](bool nullAllowed) {
+    auto mask = makeSplitBlockBloomFilterMask(
+        slice,
+        static_cast<const uint32_t*>(deviceBlocks.data()),
+        cpuBlocks.size(),
+        sizeof(SplitBlockBloomFilter::Block) / sizeof(uint32_t),
+        nullAllowed,
+        stream,
+        memoryResource);
+    std::vector<uint8_t> hostMask(mask->size());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        hostMask.data(),
+        mask->view().data<bool>(),
+        hostMask.size(),
+        cudaMemcpyDeviceToHost,
+        stream.get()));
+    stream.sync();
+    for (vector_size_t row = 0; row < slice.size(); ++row) {
+      const auto inputRow = row + 1;
+      const bool expected = values->isNullAt(inputRow)
+          ? nullAllowed
+          : cpuFilter.testInt64(values->valueAt(inputRow));
+      EXPECT_EQ(hostMask[row] != 0, expected) << "row " << row;
+    }
+  };
+  checkMask(false);
+  checkMask(true);
+
+  common::BigintValuesUsingBloomFilter expectedGpuFilter(slice.size(), false);
+  for (vector_size_t row = 1; row < 258; ++row) {
+    if (!values->isNullAt(row)) {
+      expectedGpuFilter.insert(values->valueAt(row));
+    }
+  }
+  const auto expectedGpuBlocks = expectedGpuFilter.blocks();
+  ASSERT_EQ(expectedGpuFilter.blocksByteSize(), cpuFilter.blocksByteSize());
+  CUDF_CUDA_TRY(cudaMemsetAsync(
+      deviceBlocks.data(),
+      0,
+      expectedGpuFilter.blocksByteSize(),
+      stream.get()));
+  insertSplitBlockBloomFilter(
+      slice,
+      static_cast<uint32_t*>(deviceBlocks.data()),
+      expectedGpuBlocks.size(),
+      sizeof(SplitBlockBloomFilter::Block) / sizeof(uint32_t),
+      stream);
+  std::vector<SplitBlockBloomFilter::Block> gpuBlocks(expectedGpuBlocks.size());
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      gpuBlocks.data(),
+      deviceBlocks.data(),
+      expectedGpuFilter.blocksByteSize(),
+      cudaMemcpyDeviceToHost,
+      stream.get()));
+  stream.sync();
+  EXPECT_EQ(
+      std::memcmp(
+          gpuBlocks.data(),
+          expectedGpuBlocks.data(),
+          expectedGpuFilter.blocksByteSize()),
+      0);
+  auto gpuFilter = common::BigintValuesUsingBloomFilter::createFromBlocks(
+      std::move(gpuBlocks), false);
+  for (vector_size_t row = 1; row < 258; ++row) {
+    if (!values->isNullAt(row)) {
+      EXPECT_TRUE(gpuFilter->testInt64(values->valueAt(row))) << "row " << row;
+    }
+  }
+}
+
+TEST_F(TableScanTest, bloomDynamicFilterFromHashJoin) {
+  constexpr vector_size_t kNumBuildRows{100'001};
+  constexpr vector_size_t kNumProbeRows{kNumBuildRows * 2};
+  auto rowType = ROW("c0", BIGINT());
+  auto probe = makeRowVector({makeFlatVector<int64_t>(
+      kNumProbeRows, [](auto row) { return static_cast<int64_t>(row); })});
+  auto build = makeRowVector({makeFlatVector<int64_t>(
+      kNumBuildRows, [](auto row) { return static_cast<int64_t>(row) * 2; })});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), probe);
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto buildSide = PlanBuilder(planNodeIdGenerator, pool_.get())
+                       .values({build})
+                       .project({"c0 AS u_key"})
+                       .planNode();
+  core::PlanNodeId scanId;
+  core::PlanNodeId joinId;
+  auto plan =
+      PlanBuilder(planNodeIdGenerator, pool_.get())
+          .startTableScan()
+          .connectorId(kCudfHiveConnectorId)
+          .outputType(rowType)
+          .dataColumns(rowType)
+          .assignments(
+              facebook::velox::exec::test::HiveConnectorTestBase::
+                  allRegularColumns(rowType))
+          .endTableScan()
+          .capturePlanNodeId(scanId)
+          .hashJoin(
+              {"c0"}, {"u_key"}, buildSide, "", {"c0"}, core::JoinType::kInner)
+          .capturePlanNodeId(joinId)
+          .planNode();
+
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                  .config(
+                      core::QueryConfig::kHashProbeBloomFilterPushdownMaxSize,
+                      std::to_string(2 << 20))
+                  .maxDrivers(1)
+                  .splits(scanId, makeCudfHiveConnectorSplits({filePath}))
+                  .assertResults("SELECT t.c0 FROM t JOIN u ON t.c0 = u.c0");
+  const auto stats = toPlanStats(task->taskStats());
+  EXPECT_EQ(stats.at(joinId).customStats.at("dynamicFiltersProduced").sum, 1);
+  EXPECT_GT(stats.at(joinId).customStats.at("bloomFilterSize").sum, 0);
+  EXPECT_EQ(stats.at(scanId).customStats.at("dynamicFiltersAccepted").sum, 1);
+  EXPECT_GE(stats.at(scanId).outputRows, kNumBuildRows);
+  EXPECT_LT(stats.at(scanId).outputRows, kNumProbeRows);
 }
 
 TEST_F(TableScanTest, decimalSubfieldFilter) {

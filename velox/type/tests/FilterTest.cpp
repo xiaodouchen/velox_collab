@@ -759,6 +759,12 @@ TEST(FilterTest, bigintValuesUsingBloomFilter) {
   auto nullAllowedClone = filter.clone(true);
   ASSERT_TRUE(nullAllowedClone->testNull());
   ASSERT_TRUE(nullAllowedClone->clone(false)->testingEquals(filter));
+
+  std::vector<SplitBlockBloomFilter::Block> blocks(
+      filter.blocks().begin(), filter.blocks().end());
+  auto fromBlocks =
+      BigintValuesUsingBloomFilter::createFromBlocks(std::move(blocks), false);
+  ASSERT_TRUE(fromBlocks->testingEquals(filter));
 }
 
 TEST(FilterTest, bigintValuesUsingBloomFilterMergeWith) {
