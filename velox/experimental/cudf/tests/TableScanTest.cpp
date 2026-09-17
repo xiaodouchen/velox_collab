@@ -14,11 +14,13 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
+#include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
 #include "velox/experimental/cudf/filter/CudfSplitBlockBloomFilter.h"
@@ -32,10 +34,12 @@
 #include "velox/common/memory/MemoryArbitrator.h"
 #include "velox/common/testutil/TempDirectoryPath.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/connectors/ConnectorRegistry.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/dwio/common/FileSink.h"
 #include "velox/dwio/common/tests/utils/DataFiles.h"
+#include "velox/dwio/parquet/RegisterParquetReader.h"
 #include "velox/dwio/parquet/writer/Writer.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/PlanNodeStats.h"
@@ -884,6 +888,129 @@ TEST_F(TableScanTest, integerDynamicFilterFromHashJoin) {
 #endif
 }
 
+TEST_F(TableScanTest, rejectsDynamicFiltersItCannotApply) {
+  auto physicalProbe = makeRowVector(
+      {"c0"}, {makeFlatVector<int64_t>({100, 200}, DECIMAL(18, 2))});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), physicalProbe);
+
+  auto checkJoin = [&](const TypePtr& scanType,
+                       bool useGpu,
+                       const char* expectedError) {
+    auto rowType = ROW("c0", scanType);
+    auto build = makeRowVector(
+        {"c0"}, {makeFlatVector<int64_t>({100}, scanType)});
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto buildSide = PlanBuilder(planNodeIdGenerator, pool_.get())
+                         .values({build})
+                         .project({"c0 AS u_key"})
+                         .planNode();
+    core::PlanNodeId scanId;
+    auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                    .startTableScan()
+                    .connectorId(kCudfHiveConnectorId)
+                    .outputType(rowType)
+                    .dataColumns(rowType)
+                    .assignments(
+                        HiveConnectorTestBase::allRegularColumns(rowType))
+                    .endTableScan()
+                    .capturePlanNodeId(scanId)
+                    .hashJoin(
+                        {"c0"},
+                        {"u_key"},
+                        buildSide,
+                        "",
+                        {"c0"},
+                        core::JoinType::kInner)
+                    .planNode();
+
+    VELOX_ASSERT_THROW(
+        AssertQueryBuilder(plan)
+            .config(CudfConfig::kCudfEnabled, useGpu ? "true" : "false")
+            .splits(scanId, makeCudfHiveConnectorSplits({filePath}))
+            .copyResults(pool_.get()),
+        expectedError);
+  };
+
+  {
+    auto& config = CudfConfig::getInstance();
+    const auto previousFallback = config.allowCpuFallback;
+    unregisterCudf();
+    config.allowCpuFallback = true;
+    registerCudf();
+    SCOPE_EXIT {
+      unregisterCudf();
+      config.allowCpuFallback = previousFallback;
+      registerCudf();
+    };
+    checkJoin(DECIMAL(18, 2), false, "cannot apply a dynamic filter");
+  }
+  checkJoin(BIGINT(), true, "column type does not match dynamic filter type");
+}
+
+TEST_F(TableScanTest, dynamicFilterAcrossCpuScanAndGpuJoin) {
+  const std::string cpuConnectorId{"cpu-hive-dynamic-filter"};
+  facebook::velox::connector::hive::HiveConnectorFactory factory;
+  auto cpuConnector = factory.newConnector(
+      cpuConnectorId,
+      std::make_shared<config::ConfigBase>(
+          std::unordered_map<std::string, std::string>{}),
+      ioExecutor_.get());
+  ConnectorRegistry::global().insert(cpuConnectorId, cpuConnector);
+  parquet::registerParquetReaderFactory();
+  SCOPE_EXIT {
+    parquet::unregisterParquetReaderFactory();
+    ConnectorRegistry::global().erase(cpuConnectorId);
+  };
+
+  auto rowType = ROW({"c0", "c1"}, {BIGINT(), BIGINT()});
+  auto probe = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({101, 102, 103, 104}),
+       makeFlatVector<int64_t>({1, 2, 3, 4})});
+  auto build = makeRowVector({"c0"}, {makeFlatVector<int64_t>({2, 4})});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), probe);
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto buildSide = PlanBuilder(planNodeIdGenerator, pool_.get())
+                       .values({build})
+                       .project({"c0 AS u_key"})
+                       .planNode();
+  core::PlanNodeId scanId;
+  core::PlanNodeId joinId;
+  auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                  .startTableScan()
+                  .connectorId(cpuConnectorId)
+                  .outputType(rowType)
+                  .dataColumns(rowType)
+                  .assignments(
+                      HiveConnectorTestBase::allRegularColumns(rowType))
+                  .endTableScan()
+                  .capturePlanNodeId(scanId)
+                  .hashJoin(
+                      {"c1"}, {"u_key"}, buildSide, "", {"c0"}, core::JoinType::kInner)
+                  .capturePlanNodeId(joinId)
+                  .planNode();
+  std::vector<std::shared_ptr<ConnectorSplit>> splits{
+      facebook::velox::connector::hive::HiveConnectorSplitBuilder(
+          filePath->getPath())
+          .connectorId(cpuConnectorId)
+          .fileFormat(dwio::common::FileFormat::PARQUET)
+          .build()};
+
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                  .maxDrivers(2)
+                  .splits(scanId, splits)
+                  .assertResults("SELECT t.c0 FROM t JOIN u ON t.c1 = u.c0");
+  const auto stats = toPlanStats(task->taskStats());
+  EXPECT_TRUE(stats.at(joinId).operatorStats.count("CudfFromVelox"));
+  EXPECT_GE(stats.at(joinId).customStats.at("dynamicFiltersProduced").sum, 1);
+  EXPECT_GE(stats.at(scanId).customStats.at("dynamicFiltersAccepted").sum, 1);
+}
+
 TEST_F(TableScanTest, splitBlockBloomFilterUsesVeloxFormat) {
   auto stream = cudf::get_default_stream();
   auto memoryResource = cudf::get_current_device_resource_ref();
@@ -1023,6 +1150,7 @@ TEST_F(TableScanTest, bloomDynamicFilterFromHashJoin) {
           .hashJoin(
               {"c0"}, {"u_key"}, buildSide, "", {"c0"}, core::JoinType::kInner)
           .capturePlanNodeId(joinId)
+          .project({"c0"})
           .planNode();
 
   auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)

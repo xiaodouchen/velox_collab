@@ -2453,7 +2453,7 @@ bool CudfHashJoinProbe::skipProbeOnEmptyBuild() const {
 exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
   if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin() ||
        joinNode_->isFullJoin()) &&
-      hashObject_.has_value()) {
+      buildInitialized_) {
     if (!future_.valid()) {
       return exec::BlockingReason::kNotBlocked;
     }
@@ -2461,7 +2461,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
     return exec::BlockingReason::kWaitForJoinProbe;
   }
 
-  if (hashObject_.has_value()) {
+  if (buildInitialized_) {
     return exec::BlockingReason::kNotBlocked;
   }
 
@@ -2562,6 +2562,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
       }
     }
   }
+  buildInitialized_ = true;
   if ((joinNode_->isRightJoin() || joinNode_->isRightSemiFilterJoin() ||
        joinNode_->isFullJoin()) &&
       future_.valid()) {

@@ -229,6 +229,8 @@ class CudfHashJoinProbe : public CudfOperatorBase {
   // Prevents peer probe operators from rebuilding the same filter.
   std::unordered_set<column_index_t> dynamicFiltersProducedOnKeys_;
   CudfJoinOutputLayout outputLayout_;
+  // Remains true after isFinished() releases the build tables.
+  bool buildInitialized_{false};
   bool finished_{false};
 
   /// True if any build table has NULL values in join key columns.

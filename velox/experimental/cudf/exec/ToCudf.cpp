@@ -148,7 +148,7 @@ bool CompileState::compile(bool allowCpuFallback) {
     if (previousOperatorIsNotGpu and thisOpProps.acceptsGpuInput and planNode) {
       replaceOp.push_back(
           std::make_unique<CudfFromVelox>(
-              id, planNode->outputType(), ctx, planNode->id() + "-from-velox"));
+              id, planNode->sources()[0]->outputType(), ctx, planNode->id() + "-from-velox"));
     }
     if (not replaceOp.empty()) {
       // from-velox only, because need to inserted before current operator.

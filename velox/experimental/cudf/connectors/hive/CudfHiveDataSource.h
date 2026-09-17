@@ -172,6 +172,9 @@ class CudfHiveDataSource : public DataSource, public NvtxHelper {
     std::unique_ptr<rmm::device_buffer> deviceBlocks;
   };
 
+  // Tracks columns whose storage types must match accepted dynamic filters.
+  std::unordered_set<column_index_t> dynamicFilterChannels_;
+
   // Keeps Range filters in the existing AST representation.
   common::SubfieldFilters dynamicFilters_;
 
