@@ -767,11 +767,6 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
     operators.push_back(operatorSupplier(operators.size(), ctx.get()));
   }
 
-  if (filters->empty()) {
-    filters->resize(operators.size());
-  } else {
-    VELOX_CHECK_EQ(filters->size(), operators.size());
-  }
   driver->init(std::move(ctx), std::move(operators));
   for (auto& adapter : adapters) {
     if (adapter.adapt(*this, *driver)) {
@@ -779,6 +774,11 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
     }
   }
   driver->isAdaptable_ = false;
+  if (filters->empty()) {
+    filters->resize(driver->operators_.size());
+  } else {
+    VELOX_CHECK_EQ(filters->size(), driver->operators_.size());
+  }
   driver->pushdownFilters_ = std::move(filters);
   return driver;
 }

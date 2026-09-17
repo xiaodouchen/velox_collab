@@ -316,10 +316,11 @@ void CudfHiveDataSource::addDynamicFilter(
   auto field = common::Subfield::create(readColumnNames_[outputChannel]);
 
   if (!isSupportedInteger) {
-    dynamicIntegerFilters_.erase(outputChannel);
-    dynamicBloomFilters_.erase(outputChannel);
-    dynamicFilters_.erase(*field);
-  } else if (isIntegerValues) {
+    VELOX_UNSUPPORTED(
+        "cuDF Hive scan cannot apply a dynamic filter to column: {}",
+        readColumnNames_[outputChannel]);
+  }
+  if (isIntegerValues) {
     std::vector<int64_t> values;
     if (kind == common::FilterKind::kBigintValuesUsingHashTable) {
       values =
@@ -350,13 +351,13 @@ void CudfHiveDataSource::addDynamicFilter(
     dynamicBloomFilters_.erase(outputChannel);
     dynamicFilters_.insert_or_assign(field->clone(), filter->clone());
   } else {
-    // Ignoring an unsupported filter preserves correctness. The exact join
-    // still runs after this optional scan reduction.
-    dynamicIntegerFilters_.erase(outputChannel);
-    dynamicBloomFilters_.erase(outputChannel);
-    dynamicFilters_.erase(*field);
+    VELOX_UNSUPPORTED(
+        "cuDF Hive scan cannot apply dynamic filter kind {} to column: {}",
+        static_cast<int>(kind),
+        readColumnNames_[outputChannel]);
   }
 
+  dynamicFilterChannels_.insert(outputChannel);
   dynamicFilterExpr_ = nullptr;
   dynamicFilterTree_.reset();
   dynamicFilterScalars_.clear();
@@ -382,10 +383,16 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
   }
   auto cudfTable = std::move(chunkOpt.value());
   auto stream = cudfSplitReader_->stream();
-
-  if ((dynamicFilterExpr_ || !dynamicIntegerFilters_.empty() ||
-       !dynamicBloomFilters_.empty()) &&
-      cudfTable->num_rows() > 0) {
+  if (cudfTable->num_rows() > 0) {
+    for (auto channel : dynamicFilterChannels_) {
+      VELOX_CHECK_LT(channel, cudfTable->num_columns());
+      if (cudfTable->view().column(channel).type() !=
+          veloxToCudfDataType(outputType_->childAt(channel))) {
+        VELOX_UNSUPPORTED(
+            "cuDF Hive scan column type does not match dynamic filter type: {}",
+            readColumnNames_[channel]);
+      }
+    }
     if (dynamicFilterExpr_) {
       auto mask = cudf::compute_column(
           cudfTable->view(), *dynamicFilterExpr_, stream, get_temp_mr());
@@ -397,6 +404,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       if (cudfTable->num_rows() == 0) {
         break;
       }
+      auto inputColumn = cudfTable->view().column(channel);
       if (!dynamicFilter.deviceValues) {
         dynamicFilter.deviceValues = cudf::make_fixed_width_column(
             cudf::data_type{cudf::type_id::INT64},
@@ -412,7 +420,6 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
             stream.get()));
       }
 
-      auto inputColumn = cudfTable->view().column(channel);
       std::unique_ptr<cudf::column> int64Input;
       if (inputColumn.type().id() != cudf::type_id::INT64) {
         int64Input = cudf::cast(
@@ -441,6 +448,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
       if (cudfTable->num_rows() == 0) {
         break;
       }
+      auto inputColumn = cudfTable->view().column(channel);
       const auto blocks = dynamicFilter.filter->blocks();
       if (!dynamicFilter.deviceBlocks) {
         dynamicFilter.deviceBlocks = std::make_unique<rmm::device_buffer>(
@@ -453,7 +461,7 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
             stream.get()));
       }
       auto mask = makeSplitBlockBloomFilterMask(
-          cudfTable->view().column(channel),
+          inputColumn,
           static_cast<const uint32_t*>(dynamicFilter.deviceBlocks->data()),
           blocks.size(),
           sizeof(SplitBlockBloomFilter::Block) / sizeof(uint32_t),
