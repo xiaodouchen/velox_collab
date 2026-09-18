@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveTableHandle.h"
@@ -304,9 +305,8 @@ void CudfHiveDataSource::addDynamicFilter(
   VELOX_CHECK_LT(outputChannel, outputType_->size());
 
   const auto& columnType = outputType_->childAt(outputChannel);
-  const bool isSupportedInteger = columnType == TINYINT() ||
-      columnType == SMALLINT() || columnType == INTEGER() ||
-      columnType == BIGINT();
+  const bool isSupportedInteger =
+      CudfHiveConnector::supportsDynamicFilterType(columnType);
   const auto kind = filter->kind();
   const bool isIntegerValues =
       kind == common::FilterKind::kBigintValuesUsingHashTable ||
@@ -346,7 +346,14 @@ void CudfHiveDataSource::addDynamicFilter(
     dynamicBloomFilters_.insert_or_assign(
         outputChannel, DynamicBloomFilter{std::move(bloom), nullptr});
     dynamicFilters_.erase(*field);
-  } else if (kind == common::FilterKind::kBigintRange) {
+  } else if (
+      kind == common::FilterKind::kBigintRange ||
+      kind == common::FilterKind::kBigintMultiRange ||
+      kind == common::FilterKind::kMultiRange ||
+      kind == common::FilterKind::kNegatedBigintRange ||
+      kind == common::FilterKind::kIsNull ||
+      kind == common::FilterKind::kIsNotNull ||
+      kind == common::FilterKind::kAlwaysFalse) {
     dynamicIntegerFilters_.erase(outputChannel);
     dynamicBloomFilters_.erase(outputChannel);
     dynamicFilters_.insert_or_assign(field->clone(), filter->clone());

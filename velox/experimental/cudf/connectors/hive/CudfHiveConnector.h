@@ -47,6 +47,15 @@ class CudfHiveConnector final
     return true;
   }
 
+  static bool supportsDynamicFilterType(const TypePtr& type) {
+    return type == TINYINT() || type == SMALLINT() || type == INTEGER() ||
+        type == BIGINT();
+  }
+
+  bool canAddDynamicFilterOnType(const TypePtr& type) const override {
+    return supportsDynamicFilterType(type);
+  }
+
   bool supportsSplitPreload() const override {
     return true;
   }

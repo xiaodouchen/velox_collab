@@ -1155,7 +1155,7 @@ std::unordered_set<column_index_t> Driver::canPushdownFilters(
 
       if (j == 0) {
         // Source operator.
-        if (prevOp->canAddDynamicFilter()) {
+        if (prevOp->canAddDynamicFilterOnChannel(channel)) {
           supportedChannels.emplace(channels[i]);
         }
         break;
@@ -1166,7 +1166,7 @@ std::unordered_set<column_index_t> Driver::canPushdownFilters(
           getIdentityProjection(identityProjections, channel);
       if (!inputChannel.has_value()) {
         // Filter channel is not an identity projection.
-        if (prevOp->canAddDynamicFilter()) {
+        if (prevOp->canAddDynamicFilterOnChannel(channel)) {
           supportedChannels.emplace(channels[i]);
         }
         break;
@@ -1206,7 +1206,7 @@ int Driver::pushdownFilters(
       // Continue walking upstream.
       channel = inputChannel.value();
     }
-    if (!(j >= 0 && operators_[j]->canAddDynamicFilter())) {
+    if (!(j >= 0 && operators_[j]->canAddDynamicFilterOnChannel(channel))) {
       continue;
     }
     common::FilterPtr filter;
