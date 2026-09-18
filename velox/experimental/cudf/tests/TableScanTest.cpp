@@ -1013,6 +1013,72 @@ TEST_F(TableScanTest, remainingFilterExtraction) {
       << "Expected no remaining filter time when filter is fully extracted";
 }
 
+TEST_F(TableScanTest, dynamicFilterPrunesReaderRowGroups) {
+  auto rowType = ROW("c0", BIGINT());
+  std::vector<RowVectorPtr> vectors;
+  for (int group = 0; group < 3; ++group) {
+    vectors.push_back(makeRowVector(
+        {"c0"},
+        {makeFlatVector<int64_t>(
+            1'000, [group](auto row) { return group * 1'000 + row; })}));
+  }
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vectors);
+  createDuckDbTable("t", vectors);
+  common::SubfieldFilters staticFilters =
+      common::test::SubfieldFiltersBuilder()
+          .add(
+              "c0",
+              std::make_unique<common::BigintRange>(
+                  int64_t{1500}, int64_t{1500}, false))
+          .build();
+  auto staticMetrics = readParquetWithStatsFilter(
+      filePath->getPath(), rowType, staticFilters, true);
+  EXPECT_EQ(staticMetrics.inputRowGroups, 3);
+  ASSERT_TRUE(staticMetrics.rowGroupsAfterStats.has_value());
+  EXPECT_EQ(*staticMetrics.rowGroupsAfterStats, 1);
+
+  auto build = makeRowVector(
+      {"c0"}, {makeFlatVector<int64_t>({1500})});
+  createDuckDbTable("u", {build});
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto buildSide = PlanBuilder(planNodeIdGenerator, pool_.get())
+                       .values({build})
+                       .project({"c0 AS u_key"})
+                       .planNode();
+  core::PlanNodeId scanId;
+  auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                  .startTableScan()
+                  .connectorId(kCudfHiveConnectorId)
+                  .outputType(rowType)
+                  .dataColumns(rowType)
+                  .assignments(
+                      HiveConnectorTestBase::allRegularColumns(rowType))
+                  .endTableScan()
+                  .capturePlanNodeId(scanId)
+                  .hashJoin(
+                      {"c0"}, {"u_key"}, buildSide, "", {"c0"}, core::JoinType::kInner)
+                  .planNode();
+  std::atomic<int32_t> selected{-1};
+  const bool testValuesWereEnabled = common::testutil::TestValue::enabled();
+  common::testutil::TestValue::enable();
+  SCOPE_EXIT {
+    if (!testValuesWereEnabled) {
+      common::testutil::TestValue::disable();
+    }
+  };
+  common::testutil::ScopedTestValue selectedCounter(
+      "facebook::velox::cudf_velox::connector::hive::CudfSplitReader::selectedRowGroups",
+      std::function<void(void*)>([&](void* value) {
+        selected = *static_cast<size_t*>(value);
+      }));
+  AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .maxDrivers(1)
+      .splits(scanId, makeCudfHiveConnectorSplits({filePath}))
+      .assertResults("SELECT t.c0 FROM t JOIN u ON t.c0 = u.c0");
+  EXPECT_EQ(selected, 1);
+}
+
 TEST_F(TableScanTest, integerDynamicFilterFromHashJoin) {
   constexpr vector_size_t kNumBuildRows{
       ::facebook::velox::exec::VectorHasher::kMaxDistinct + 1};

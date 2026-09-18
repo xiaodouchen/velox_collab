@@ -431,11 +431,7 @@ cudf::ast::expression const& createAstFromSubfieldFilterImpl(
 
   switch (filter.kind()) {
     case common::FilterKind::kAlwaysFalse: {
-      scalars.emplace_back(std::make_unique<cudf::numeric_scalar<bool>>(
-          false, true, stream, mr));
-      stream.sync();
-      return tree.push(cudf::ast::literal{
-          *static_cast<cudf::numeric_scalar<bool>*>(scalars.back().get())});
+      return createAlwaysFalseExpr(columnRef, tree);
     }
 
     case common::FilterKind::kBigintRange: {

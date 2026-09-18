@@ -179,7 +179,8 @@ std::unique_ptr<CudfSplitReader> CudfHiveDataSource::createCudfSplitReader() {
       cudfHiveConfig_,
       ioStatistics_,
       ioStats_,
-      subfieldFilterAst_);
+      subfieldFilterAst_,
+      dynamicFilters_.empty() ? nullptr : &dynamicFilters_);
 }
 
 void CudfHiveDataSource::convertSplit(std::shared_ptr<ConnectorSplit> split) {

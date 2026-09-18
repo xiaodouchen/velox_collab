@@ -27,13 +27,16 @@
 #include "velox/connectors/hive/FileHandle.h"
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/dwio/common/Statistics.h"
+#include "velox/type/Filter.h"
 #include "velox/type/Type.h"
 
+#include <cudf/ast/expressions.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan_multifile.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/io/types.hpp>
+#include <cudf/scalar/scalar.hpp>
 
 #include <functional>
 #include <span>
@@ -71,7 +74,8 @@ class CudfSplitReader : public NvtxHelper {
       const std::shared_ptr<CudfHiveConfig>& cudfHiveConfig,
       const std::shared_ptr<io::IoStatistics>& ioStatistics,
       const std::shared_ptr<IoStats>& ioStats,
-      const cudf::ast::expression* subfieldFilterAst);
+      const cudf::ast::expression* subfieldFilterAst,
+      const common::SubfieldFilters* dynamicFilters = nullptr);
 
   virtual ~CudfSplitReader();
 
@@ -215,6 +219,10 @@ class CudfSplitReader : public NvtxHelper {
 
   std::shared_ptr<CudfHiveConfig> cudfHiveConfig_;
   memory::MemoryPool* pool_;
+  // Keep scalars alive until the AST that references them is destroyed.
+  std::vector<std::unique_ptr<cudf::scalar>> readerDynamicFilterScalars_;
+  cudf::ast::tree readerDynamicFilterTree_;
+  std::vector<std::pair<std::string, cudf::data_type>> readerDynamicFilterTypes_;
 
   // cuDF split reader stuff.
   std::shared_ptr<cudf::io::datasource> dataSource_;
@@ -232,6 +240,7 @@ class CudfSplitReader : public NvtxHelper {
 
   dwio::common::ReaderOptions baseReaderOpts_;
   const cudf::ast::expression* subfieldFilterAst_;
+  const cudf::ast::expression* readerBaseFilterAst_;
   cudf::ast::expression const* pushdownFilterExpr_;
   PushdownFilterBuilder pushdownFilterBuilder_;
   bool hasSplitSpecificPushdownFilter_{false};
