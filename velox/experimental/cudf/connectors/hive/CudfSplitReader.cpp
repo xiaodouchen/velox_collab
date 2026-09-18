@@ -19,8 +19,10 @@
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
 
 #include "velox/common/caching/CacheTTLController.h"
+#include "velox/common/testutil/TestValue.h"
 #include "velox/common/time/Timer.h"
 #include "velox/connectors/hive/BufferedInputBuilder.h"
 #include "velox/connectors/hive/FileHandle.h"
@@ -171,7 +173,9 @@ CudfSplitReader::CudfSplitReader(
     const std::shared_ptr<io::IoStatistics>& ioStatistics,
     const std::shared_ptr<IoStats>& ioStats,
     bool useExperimentalCudfReader,
-    const cudf::ast::expression* subfieldFilterAst)
+    const cudf::ast::expression* subfieldFilterAst,
+    const common::SubfieldFilters* dynamicFilters,
+    RowTypePtr filterRowType)
     : NvtxHelper(
           nvtx3::rgb{80, 171, 241},
           std::nullopt,
@@ -190,7 +194,30 @@ CudfSplitReader::CudfSplitReader(
       useExperimentalCudfReader_(useExperimentalCudfReader),
       baseReaderOpts_(pool_),
       subfieldFilterAst_(subfieldFilterAst),
+      readerBaseFilterAst_(subfieldFilterAst),
       pushdownFilterExpr_(subfieldFilterAst) {
+  if (dynamicFilters && !dynamicFilters->empty()) {
+    VELOX_CHECK_NOT_NULL(filterRowType);
+    for (const auto& [field, _] : *dynamicFilters) {
+      auto name = field.toString();
+      auto type = filterRowType->findChild(name);
+      VELOX_CHECK_NOT_NULL(type);
+      readerDynamicFilterTypes_.emplace_back(
+          std::move(name), veloxToCudfDataType(type));
+    }
+    const auto& dynamicExpr = createAstFromSubfieldFilters(
+        *dynamicFilters,
+        readerDynamicFilterTree_,
+        readerDynamicFilterScalars_,
+        filterRowType);
+    readerBaseFilterAst_ = subfieldFilterAst_
+        ? &readerDynamicFilterTree_.push(cudf::ast::operation{
+              cudf::ast::ast_operator::NULL_LOGICAL_AND,
+              *subfieldFilterAst_,
+              dynamicExpr})
+        : &dynamicExpr;
+    pushdownFilterExpr_ = readerBaseFilterAst_;
+  }
   baseReaderOpts_.setDataIoStats(ioStatistics_);
   baseReaderOpts_.setMetadataIoStats(ioStatistics_);
 }
@@ -288,6 +315,10 @@ std::optional<std::unique_ptr<cudf::table>> CudfSplitReader::readNextChunk() {
       rowGroupIndices = exptSplitReader_->filter_row_groups_with_stats(
           rowGroupIndices, readerOptions_, stream_);
     }
+    auto selectedRowGroups = rowGroupIndices.size();
+    common::testutil::TestValue::adjust(
+        "facebook::velox::cudf_velox::connector::hive::CudfSplitReader::selectedRowGroups",
+        &selectedRowGroups);
 
     // Get column chunk byte ranges to fetch
     const auto columnChunkByteRanges =
@@ -338,7 +369,7 @@ void CudfSplitReader::resetSplit() {
   hybridScanState_.reset();
   dataSource_.reset();
   fileMetaData_.clear();
-  pushdownFilterExpr_ = subfieldFilterAst_;
+  pushdownFilterExpr_ = readerBaseFilterAst_;
   hasSplitSpecificPushdownFilter_ = false;
 }
 
@@ -516,6 +547,24 @@ void CudfSplitReader::fileMetaDatas() {
       fileMetaData_.size(),
       1,
       "CudfSplitReader failed to read any parquet metadatas");
+
+  if (!readerDynamicFilterTypes_.empty()) {
+    // cuDF evaluates reader filters before the scan validates column types.
+    const auto metadata =
+        cudf::io::read_parquet_metadata(cudf::io::source_info{dataSource_.get()});
+    const auto& columns = metadata.schema().root().children();
+    for (const auto& [name, type] : readerDynamicFilterTypes_) {
+      auto column =
+          std::find_if(columns.begin(), columns.end(), [&](const auto& child) {
+            return child.name() == name;
+          });
+      if (column == columns.end() || column->cudf_type() != type) {
+        readerBaseFilterAst_ = subfieldFilterAst_;
+        pushdownFilterExpr_ = subfieldFilterAst_;
+        break;
+      }
+    }
+  }
 
   if (pushdownFilterBuilder_) {
     VELOX_CHECK_EQ(

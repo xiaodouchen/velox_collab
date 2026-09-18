@@ -172,6 +172,8 @@ CudfHiveDataSource::CudfHiveDataSource(
 }
 
 std::unique_ptr<CudfSplitReader> CudfHiveDataSource::createCudfSplitReader() {
+  const bool readerDynamicFilter =
+      useExperimentalCudfReader_ && !dynamicFilters_.empty();
   return std::make_unique<CudfSplitReader>(
       split_,
       tableHandle_,
@@ -184,7 +186,9 @@ std::unique_ptr<CudfSplitReader> CudfHiveDataSource::createCudfSplitReader() {
       ioStatistics_,
       ioStats_,
       useExperimentalCudfReader_,
-      subfieldFilterAst_);
+      subfieldFilterAst_,
+      readerDynamicFilter ? &dynamicFilters_ : nullptr,
+      readerDynamicFilter ? getTableRowType() : nullptr);
 }
 
 void CudfHiveDataSource::convertSplit(std::shared_ptr<ConnectorSplit> split) {
