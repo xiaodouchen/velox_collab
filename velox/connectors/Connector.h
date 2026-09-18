@@ -729,10 +729,14 @@ class Connector {
     return nullptr;
   }
 
-  /// Returns true if this connector would accept a filter dynamically
-  /// generated during query execution.
+  /// Returns true if this connector accepts dynamic filters on any column.
   virtual bool canAddDynamicFilter() const {
     return false;
+  }
+
+  /// Returns whether this connector accepts a filter on a column type.
+  virtual bool canAddDynamicFilterOnType(const TypePtr& /*type*/) const {
+    return canAddDynamicFilter();
   }
 
   virtual std::unique_ptr<DataSource> createDataSource(

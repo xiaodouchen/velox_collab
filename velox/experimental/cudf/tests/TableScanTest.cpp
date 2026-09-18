@@ -895,7 +895,7 @@ TEST_F(TableScanTest, rejectsDynamicFiltersItCannotApply) {
   writeToFile(filePath->getPath(), physicalProbe);
 
   auto checkJoin = [&](const TypePtr& scanType,
-                       bool useGpu,
+                       bool useGpuJoin,
                        const char* expectedError) {
     auto rowType = ROW("c0", scanType);
     auto build = makeRowVector(
@@ -906,6 +906,7 @@ TEST_F(TableScanTest, rejectsDynamicFiltersItCannotApply) {
                          .project({"c0 AS u_key"})
                          .planNode();
     core::PlanNodeId scanId;
+    core::PlanNodeId joinId;
     auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
                     .startTableScan()
                     .connectorId(kCudfHiveConnectorId)
@@ -921,15 +922,26 @@ TEST_F(TableScanTest, rejectsDynamicFiltersItCannotApply) {
                         buildSide,
                         "",
                         {"c0"},
-                        core::JoinType::kInner)
+                        useGpuJoin ? core::JoinType::kInner
+                                   : core::JoinType::kCountingLeftSemiFilter,
+                        /*nullAware=*/false,
+                        /*nullAsValue=*/!useGpuJoin)
+                    .capturePlanNodeId(joinId)
                     .planNode();
 
-    VELOX_ASSERT_THROW(
-        AssertQueryBuilder(plan)
-            .config(CudfConfig::kCudfEnabled, useGpu ? "true" : "false")
-            .splits(scanId, makeCudfHiveConnectorSplits({filePath}))
-            .copyResults(pool_.get()),
-        expectedError);
+    AssertQueryBuilder query(plan);
+    query.config(CudfConfig::kCudfEnabled, "true")
+        .splits(scanId, makeCudfHiveConnectorSplits({filePath}));
+    if (expectedError) {
+      VELOX_ASSERT_THROW(query.copyResults(pool_.get()), expectedError);
+    } else {
+      auto expected = makeRowVector(
+          {"c0"}, {makeFlatVector<int64_t>({100}, scanType)});
+      auto task = query.assertResults(expected);
+      const auto stats = toPlanStats(task->taskStats());
+      EXPECT_TRUE(stats.at(joinId).operatorStats.count("HashProbe"));
+      EXPECT_TRUE(stats.at(scanId).dynamicFilterStats.producerNodeIds.empty());
+    }
   };
 
   {
@@ -943,9 +955,67 @@ TEST_F(TableScanTest, rejectsDynamicFiltersItCannotApply) {
       config.allowCpuFallback = previousFallback;
       registerCudf();
     };
-    checkJoin(DECIMAL(18, 2), false, "cannot apply a dynamic filter");
+    checkJoin(DECIMAL(18, 2), false, nullptr);
   }
   checkJoin(BIGINT(), true, "column type does not match dynamic filter type");
+}
+
+TEST_F(TableScanTest, disjointDynamicFiltersProduceNoRows) {
+  auto rowType = ROW("c0", BIGINT());
+  auto probe = makeRowVector(
+      {"c0"}, {makeFlatVector<int64_t>({1, 2, 3})});
+  auto firstBuild = makeRowVector(
+      {"c0"}, {makeFlatVector<int64_t>({1})});
+  auto secondBuild = makeRowVector(
+      {"c0"}, {makeFlatVector<int64_t>({2})});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), probe);
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {firstBuild});
+  createDuckDbTable("v", {secondBuild});
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto firstBuildSide = PlanBuilder(planNodeIdGenerator, pool_.get())
+                            .values({firstBuild})
+                            .project({"c0 AS u_key"})
+                            .planNode();
+  auto secondBuildSide = PlanBuilder(planNodeIdGenerator, pool_.get())
+                             .values({secondBuild})
+                             .project({"c0 AS v_key"})
+                             .planNode();
+  core::PlanNodeId scanId;
+  auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                  .startTableScan()
+                  .connectorId(kCudfHiveConnectorId)
+                  .outputType(rowType)
+                  .dataColumns(rowType)
+                  .assignments(
+                      HiveConnectorTestBase::allRegularColumns(rowType))
+                  .endTableScan()
+                  .capturePlanNodeId(scanId)
+                  .hashJoin(
+                      {"c0"},
+                      {"u_key"},
+                      firstBuildSide,
+                      "",
+                      {"c0"},
+                      core::JoinType::kInner)
+                  .hashJoin(
+                      {"c0"},
+                      {"v_key"},
+                      secondBuildSide,
+                      "",
+                      {"c0"},
+                      core::JoinType::kInner)
+                  .planNode();
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                  .splits(scanId, makeCudfHiveConnectorSplits({filePath}))
+                  .assertResults(
+                      "SELECT t.c0 FROM t JOIN u ON t.c0 = u.c0 "
+                      "JOIN v ON t.c0 = v.c0");
+  const auto stats = toPlanStats(task->taskStats());
+  EXPECT_GE(stats.at(scanId).customStats.at("dynamicFiltersAccepted").sum, 2);
+  EXPECT_EQ(stats.at(scanId).outputRows, 0);
 }
 
 TEST_F(TableScanTest, dynamicFilterAcrossCpuScanAndGpuJoin) {

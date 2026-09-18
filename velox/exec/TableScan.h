@@ -54,6 +54,10 @@ class TableScan : public SourceOperator {
     return connector_->canAddDynamicFilter();
   }
 
+  bool canAddDynamicFilterOnChannel(column_index_t channel) const override {
+    return connector_->canAddDynamicFilterOnType(outputType_->childAt(channel));
+  }
+
   void addDynamicFilterLocked(
       const core::PlanNodeId& producer,
       const PushdownFilters& filters) override;
