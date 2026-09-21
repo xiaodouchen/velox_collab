@@ -352,6 +352,8 @@ void CudfHiveDataSource::addDynamicFilter(
       kind == common::FilterKind::kBigintMultiRange ||
       kind == common::FilterKind::kMultiRange ||
       kind == common::FilterKind::kNegatedBigintRange ||
+      kind == common::FilterKind::kNegatedBigintValuesUsingHashTable ||
+      kind == common::FilterKind::kNegatedBigintValuesUsingBitmask ||
       kind == common::FilterKind::kIsNull ||
       kind == common::FilterKind::kIsNotNull ||
       kind == common::FilterKind::kAlwaysFalse) {

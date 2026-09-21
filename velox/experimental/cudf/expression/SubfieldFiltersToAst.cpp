@@ -275,10 +275,8 @@ const cudf::ast::expression& createBytesRangeExpr(
       cudf::string_scalar>(filter, tree, scalars, columnRef, stream, mr);
 }
 
-// Build an IN-list expression for integer columns where the filter values are
-// provided as int64_t but the column may be any integral type. Values outside
-// the target type's range are ignored. If all values are out of range, this
-// returns a constant false expression (col != col).
+// Build an IN or NOT IN expression for an integer column. Values outside the
+// column type's range cannot match and are ignored.
 template <TypeKind Kind>
 std::reference_wrapper<const cudf::ast::expression> buildIntegerInListExpr(
     const common::Filter& filter,
@@ -289,14 +287,36 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerInListExpr(
     rmm::device_async_resource_ref /*mr*/,
     const TypePtr& columnTypePtr) {
   using NativeT = typename TypeTraits<Kind>::NativeType;
+  const bool negated =
+      filter.kind() ==
+          common::FilterKind::kNegatedBigintValuesUsingHashTable ||
+      filter.kind() == common::FilterKind::kNegatedBigintValuesUsingBitmask;
 
   if constexpr (std::is_integral_v<NativeT>) {
     using Op = cudf::ast::ast_operator;
     using Operation = cudf::ast::operation;
 
-    auto* valuesFilter =
-        static_cast<const common::BigintValuesUsingBitmask*>(&filter);
-    const auto& values = valuesFilter->values();
+    std::vector<int64_t> values;
+    switch (filter.kind()) {
+      case common::FilterKind::kBigintValuesUsingBitmask:
+        values = static_cast<const common::BigintValuesUsingBitmask*>(&filter)
+                     ->values();
+        break;
+      case common::FilterKind::kNegatedBigintValuesUsingHashTable:
+        values =
+            static_cast<const common::NegatedBigintValuesUsingHashTable*>(
+                &filter)
+                ->values();
+        break;
+      case common::FilterKind::kNegatedBigintValuesUsingBitmask:
+        values =
+            static_cast<const common::NegatedBigintValuesUsingBitmask*>(
+                &filter)
+                ->values();
+        break;
+      default:
+        VELOX_UNREACHABLE();
+    }
 
     std::vector<const cudf::ast::expression*> exprVec;
     exprVec.reserve(values.size());
@@ -312,21 +332,23 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerInListExpr(
       const auto& literal =
           makeScalarAndLiteral<Kind>(columnTypePtr, veloxVariant, scalars);
       auto const& cudfLiteral = tree.push(literal);
-      auto const& equalExpr =
-          tree.push(Operation{Op::EQUAL, columnRef, cudfLiteral});
-      exprVec.push_back(&equalExpr);
+      auto const& comparison = tree.push(Operation{
+          negated ? Op::NOT_EQUAL : Op::EQUAL, columnRef, cudfLiteral});
+      exprVec.push_back(&comparison);
     }
 
     if (exprVec.empty()) {
-      // No representable values -> always false
-      auto const& alwaysFalse =
-          tree.push(Operation{Op::NOT_EQUAL, columnRef, columnRef});
-      return std::ref(alwaysFalse);
+      auto const& constant = tree.push(Operation{
+          negated ? Op::EQUAL : Op::NOT_EQUAL, columnRef, columnRef});
+      return std::ref(constant);
     }
 
     const cudf::ast::expression* result = exprVec[0];
     for (size_t i = 1; i < exprVec.size(); ++i) {
-      result = &tree.push(Operation{Op::NULL_LOGICAL_OR, *result, *exprVec[i]});
+      result = &tree.push(Operation{
+          negated ? Op::NULL_LOGICAL_AND : Op::NULL_LOGICAL_OR,
+          *result,
+          *exprVec[i]});
     }
     return std::ref(*result);
   } else {
@@ -465,6 +487,22 @@ cudf::ast::expression const& createAstFromSubfieldFilterImpl(
     case common::FilterKind::kBigintValuesUsingBitmask: {
       auto const& columnType = inputRowSchema->childAt(columnIndex);
       // Dispatch by the column's integer kind and cast filter values to it.
+      auto result = VELOX_DYNAMIC_TYPE_DISPATCH(
+          buildIntegerInListExpr,
+          columnType->kind(),
+          filter,
+          tree,
+          scalars,
+          columnRef,
+          stream,
+          mr,
+          columnType);
+      return result.get();
+    }
+
+    case common::FilterKind::kNegatedBigintValuesUsingHashTable:
+    case common::FilterKind::kNegatedBigintValuesUsingBitmask: {
+      auto const& columnType = inputRowSchema->childAt(columnIndex);
       auto result = VELOX_DYNAMIC_TYPE_DISPATCH(
           buildIntegerInListExpr,
           columnType->kind(),

@@ -203,6 +203,10 @@ TEST_F(SubfieldFilterAstTest, nullAllowed) {
   filters.push_back(
       common::createBigintValues(
           std::vector<int64_t>{10, 20}, /*nullAllowed*/ true));
+  filters.push_back(common::createNegatedBigintValues(
+      std::vector<int64_t>{10, 20}, /*nullAllowed*/ true));
+  filters.push_back(common::createNegatedBigintValues(
+      std::vector<int64_t>{10, 10'000}, /*nullAllowed*/ true));
   filters.push_back(
       std::make_unique<common::NegatedBigintRange>(
           10, 20, /*nullAllowed*/ true));
@@ -224,6 +228,59 @@ TEST_F(SubfieldFilterAstTest, nullAllowed) {
         createAstFromSubfieldFilter(subfield, *filter, tree, scalars, rowType);
     testFilterExecution(rowType, columnName, *filter, vector, expr);
   }
+}
+
+TEST_F(SubfieldFilterAstTest, negatedNarrowIntegerValues) {
+  auto check = [&](const RowTypePtr& rowType,
+                   const RowVectorPtr& rows,
+                   const std::vector<int64_t>& rejected,
+                   bool nullAllowed,
+                   common::FilterKind expectedKind) {
+    auto filter = common::createNegatedBigintValues(rejected, nullAllowed);
+    ASSERT_EQ(filter->kind(), expectedKind);
+    common::Subfield subfield("c0");
+    cudf::ast::tree tree;
+    std::vector<std::unique_ptr<cudf::scalar>> scalars;
+    const auto& expr = createAstFromSubfieldFilter(
+        subfield, *filter, tree, scalars, rowType);
+    testFilterExecution(rowType, "c0", *filter, rows, expr);
+  };
+
+  auto tinyType = ROW("c0", TINYINT());
+  auto tinyRows = makeRowVector(
+      {"c0"},
+      {makeNullableFlatVector<int8_t>(
+          {-128, 0, 1, 10, 127, std::nullopt})});
+  check(
+      tinyType,
+      tinyRows,
+      {1, 1000},
+      true,
+      common::FilterKind::kNegatedBigintValuesUsingBitmask);
+  check(
+      tinyType,
+      tinyRows,
+      {1000, 2000},
+      false,
+      common::FilterKind::kNegatedBigintValuesUsingBitmask);
+
+  auto smallType = ROW("c0", SMALLINT());
+  auto smallRows = makeRowVector(
+      {"c0"},
+      {makeNullableFlatVector<int16_t>(
+          {-32768, 0, 10, 10000, 32767, std::nullopt})});
+  check(
+      smallType,
+      smallRows,
+      {10, 10000, 100000},
+      true,
+      common::FilterKind::kNegatedBigintValuesUsingHashTable);
+  check(
+      smallType,
+      smallRows,
+      {100000, 200000},
+      false,
+      common::FilterKind::kNegatedBigintValuesUsingHashTable);
 }
 
 TEST_F(SubfieldFilterAstTest, doubleRange) {

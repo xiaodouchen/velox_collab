@@ -1014,13 +1014,15 @@ TEST_F(TableScanTest, remainingFilterExtraction) {
 }
 
 TEST_F(TableScanTest, dynamicFilterPrunesReaderRowGroups) {
-  auto rowType = ROW("c0", BIGINT());
+  auto rowType = ROW({"c0", "c1"}, BIGINT());
   std::vector<RowVectorPtr> vectors;
   for (int group = 0; group < 3; ++group) {
     vectors.push_back(makeRowVector(
-        {"c0"},
+        {"c0", "c1"},
         {makeFlatVector<int64_t>(
-            1'000, [group](auto row) { return group * 1'000 + row; })}));
+             1'000, [group](auto row) { return group * 1'000 + row; }),
+         makeFlatVector<int64_t>(
+             1'000, [group](auto row) { return group * 10'000 + row; })}));
   }
   auto filePath = TempFilePath::create();
   writeToFile(filePath->getPath(), vectors);
@@ -1047,17 +1049,23 @@ TEST_F(TableScanTest, dynamicFilterPrunesReaderRowGroups) {
                        .project({"c0 AS u_key"})
                        .planNode();
   core::PlanNodeId scanId;
+  auto scanType = ROW({"c1", "c0"}, BIGINT());
   auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
                   .startTableScan()
                   .connectorId(kCudfHiveConnectorId)
-                  .outputType(rowType)
+                  .outputType(scanType)
                   .dataColumns(rowType)
                   .assignments(
                       HiveConnectorTestBase::allRegularColumns(rowType))
                   .endTableScan()
                   .capturePlanNodeId(scanId)
                   .hashJoin(
-                      {"c0"}, {"u_key"}, buildSide, "", {"c0"}, core::JoinType::kInner)
+                      {"c0"},
+                      {"u_key"},
+                      buildSide,
+                      "",
+                      {"c0", "c1"},
+                      core::JoinType::kInner)
                   .planNode();
   std::atomic<int32_t> selected{-1};
   const bool testValuesWereEnabled = common::testutil::TestValue::enabled();
@@ -1075,7 +1083,7 @@ TEST_F(TableScanTest, dynamicFilterPrunesReaderRowGroups) {
   AssertQueryBuilder(plan, duckDbQueryRunner_)
       .maxDrivers(1)
       .splits(scanId, makeCudfHiveConnectorSplits({filePath}))
-      .assertResults("SELECT t.c0 FROM t JOIN u ON t.c0 = u.c0");
+      .assertResults("SELECT t.c0, t.c1 FROM t JOIN u ON t.c0 = u.c0");
   EXPECT_EQ(selected, 1);
 }
 
@@ -1507,6 +1515,78 @@ TEST_F(TableScanTest, bloomDynamicFilterFromHashJoin) {
   EXPECT_EQ(stats.at(scanId).customStats.at("dynamicFiltersAccepted").sum, 1);
   EXPECT_GE(stats.at(scanId).outputRows, kNumBuildRows);
   EXPECT_LT(stats.at(scanId).outputRows, kNumProbeRows);
+}
+
+TEST_F(TableScanTest, negatedStaticFilterWithBloomDynamicFilter) {
+  constexpr vector_size_t kNumBuildRows{100'001};
+  constexpr vector_size_t kNumProbeRows{kNumBuildRows * 2};
+  auto rowType = ROW("c0", BIGINT());
+  auto probe = makeRowVector({makeFlatVector<int64_t>(
+      kNumProbeRows, [](auto row) { return static_cast<int64_t>(row); })});
+  auto build = makeRowVector({makeFlatVector<int64_t>(
+      kNumBuildRows, [](auto row) { return static_cast<int64_t>(row) * 2; })});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), probe);
+  createDuckDbTable("t", {probe});
+  createDuckDbTable("u", {build});
+
+  auto runTest = [&](const std::vector<int64_t>& rejectedValues,
+                     common::FilterKind expectedKind) {
+    auto filter = common::createNegatedBigintValues(rejectedValues, false);
+    ASSERT_EQ(filter->kind(), expectedKind);
+    auto subfieldFilters = common::test::SubfieldFiltersBuilder()
+                               .add("c0", std::move(filter))
+                               .build();
+    auto tableHandle = makeTableHandle(
+        "parquet_table", rowType, std::move(subfieldFilters), nullptr);
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto buildSide = PlanBuilder(planNodeIdGenerator, pool_.get())
+                         .values({build})
+                         .project({"c0 AS u_key"})
+                         .planNode();
+    core::PlanNodeId scanId;
+    core::PlanNodeId joinId;
+    auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                    .startTableScan()
+                    .connectorId(kCudfHiveConnectorId)
+                    .outputType(rowType)
+                    .tableHandle(tableHandle)
+                    .assignments(
+                        HiveConnectorTestBase::allRegularColumns(rowType))
+                    .endTableScan()
+                    .capturePlanNodeId(scanId)
+                    .hashJoin(
+                        {"c0"},
+                        {"u_key"},
+                        buildSide,
+                        "",
+                        {"c0"},
+                        core::JoinType::kInner)
+                    .capturePlanNodeId(joinId)
+                    .planNode();
+
+    auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                    .config(
+                        core::QueryConfig::kHashProbeBloomFilterPushdownMaxSize,
+                        std::to_string(2 << 20))
+                    .maxDrivers(1)
+                    .splits(scanId, makeCudfHiveConnectorSplits({filePath}))
+                    .assertResults(fmt::format(
+                        "SELECT t.c0 FROM t JOIN u ON t.c0 = u.c0 "
+                        "WHERE t.c0 NOT IN ({})",
+                        fmt::join(rejectedValues, ", ")));
+    const auto stats = toPlanStats(task->taskStats());
+    EXPECT_EQ(
+        stats.at(joinId).customStats.at("dynamicFiltersProduced").sum, 1);
+    EXPECT_GT(stats.at(joinId).customStats.at("bloomFilterSize").sum, 0);
+    EXPECT_EQ(
+        stats.at(scanId).customStats.at("dynamicFiltersAccepted").sum, 1);
+  };
+
+  runTest(
+      {0, 2}, common::FilterKind::kNegatedBigintValuesUsingBitmask);
+  runTest(
+      {0, 10'000}, common::FilterKind::kNegatedBigintValuesUsingHashTable);
 }
 
 TEST_F(TableScanTest, decimalSubfieldFilter) {
