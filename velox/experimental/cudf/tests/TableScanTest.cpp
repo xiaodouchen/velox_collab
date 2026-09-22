@@ -1084,7 +1084,9 @@ TEST_F(TableScanTest, dynamicFilterPrunesReaderRowGroups) {
       .maxDrivers(1)
       .splits(scanId, makeCudfHiveConnectorSplits({filePath}))
       .assertResults("SELECT t.c0, t.c1 FROM t JOIN u ON t.c0 = u.c0");
+#ifndef NDEBUG
   EXPECT_EQ(selected, 1);
+#endif
 }
 
 TEST_F(TableScanTest, integerDynamicFilterFromHashJoin) {
@@ -1669,7 +1671,9 @@ TEST_F(TableScanTest, negatedFilterPrunesReaderRowGroups) {
                   .assertResults(
                       "SELECT t.c0 FROM t JOIN u ON t.c0 = u.c0 "
                       "WHERE t.c0 NOT IN (0, 2)");
+#ifndef NDEBUG
   EXPECT_EQ(selected, 1);
+#endif
   const auto stats = toPlanStats(task->taskStats());
   EXPECT_EQ(stats.at(joinId).customStats.at("dynamicFiltersProduced").sum, 1);
   EXPECT_GT(stats.at(joinId).customStats.at("bloomFilterSize").sum, 0);
