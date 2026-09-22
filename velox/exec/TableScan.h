@@ -54,6 +54,7 @@ class TableScan : public SourceOperator {
     return connector_->canAddDynamicFilter();
   }
 
+  /// Checks the output type before the driver counts filter delivery.
   bool canAddDynamicFilterOnChannel(column_index_t channel) const override {
     return connector_->canAddDynamicFilterOnType(outputType_->childAt(channel));
   }

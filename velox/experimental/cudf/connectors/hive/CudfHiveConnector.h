@@ -52,6 +52,8 @@ class CudfHiveConnector final
         type == BIGINT();
   }
 
+  /// Only integer columns can accept delivered filters; the probe keeps
+  /// the exact join for other column types.
   bool canAddDynamicFilterOnType(const TypePtr& type) const override {
     return supportsDynamicFilterType(type);
   }

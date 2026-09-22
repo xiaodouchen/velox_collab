@@ -62,6 +62,8 @@ std::unique_ptr<cudf::table> castDecimalColumnsToVeloxTypes(
 
 class CudfSplitReader : public NvtxHelper {
  public:
+  /// Snapshots dynamicFilters for reader pruning. Later filters remain in the
+  /// data source for post-read filtering.
   CudfSplitReader(
       std::shared_ptr<CudfHiveConnectorSplit> split,
       std::shared_ptr<const ::facebook::velox::connector::hive::HiveTableHandle>
@@ -75,7 +77,7 @@ class CudfSplitReader : public NvtxHelper {
       const std::shared_ptr<io::IoStatistics>& ioStatistics,
       const std::shared_ptr<IoStats>& ioStats,
       const cudf::ast::expression* subfieldFilterAst,
-      const common::SubfieldFilters* dynamicFilters = nullptr);
+      const common::SubfieldFilters* dynamicFilters);
 
   virtual ~CudfSplitReader();
 
@@ -221,7 +223,9 @@ class CudfSplitReader : public NvtxHelper {
   memory::MemoryPool* pool_;
   // Keep scalars alive until the AST that references them is destroyed.
   std::vector<std::unique_ptr<cudf::scalar>> readerDynamicFilterScalars_;
+  // Owns dynamic AST nodes while readerBaseFilterAst_ points to them.
   cudf::ast::tree readerDynamicFilterTree_;
+  // Footer types decide whether reader pruning can safely use the AST.
   std::vector<std::pair<std::string, cudf::data_type>> readerDynamicFilterTypes_;
 
   // cuDF split reader stuff.
@@ -240,6 +244,7 @@ class CudfSplitReader : public NvtxHelper {
 
   dwio::common::ReaderOptions baseReaderOpts_;
   const cudf::ast::expression* subfieldFilterAst_;
+  // Falls back to the static AST if a Parquet column type differs.
   const cudf::ast::expression* readerBaseFilterAst_;
   cudf::ast::expression const* pushdownFilterExpr_;
   PushdownFilterBuilder pushdownFilterBuilder_;
