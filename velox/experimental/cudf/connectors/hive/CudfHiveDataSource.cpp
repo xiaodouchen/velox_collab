@@ -373,11 +373,14 @@ void CudfHiveDataSource::addDynamicFilter(
   dynamicFilterScalars_.clear();
   if (!dynamicFilters_.empty()) {
     dynamicFilterTree_ = std::make_unique<cudf::ast::tree>();
+    auto dynamicFilterType = tableHandle_->dataColumns()
+        ? getTableRowType()
+        : ROW(readColumnNames_, outputType_->children());
     dynamicFilterExpr_ = &createAstFromSubfieldFilters(
         dynamicFilters_,
         *dynamicFilterTree_,
         dynamicFilterScalars_,
-        getTableRowType());
+        dynamicFilterType);
   }
 }
 

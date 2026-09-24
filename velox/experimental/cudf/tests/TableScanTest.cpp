@@ -679,6 +679,52 @@ TEST_F(TableScanTest, columnAliases) {
   assertQuery(op, {filePath}, "SELECT c0 FROM tmp");
 }
 
+TEST_F(TableScanTest, dynamicFilterUsesPhysicalNamesWithoutDataColumns) {
+  auto probe = makeRowVector(
+      {"c0", "c1"},
+      {makeFlatVector<int64_t>({1}), makeFlatVector<int64_t>({9})});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), probe);
+
+  auto build = makeRowVector(
+      {"u_key"}, {makeFlatVector<int64_t>({1})});
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto buildSide = PlanBuilder(planNodeIdGenerator, pool_.get())
+                       .values({build})
+                       .planNode();
+  core::PlanNodeId scanId;
+  core::PlanNodeId joinId;
+  auto outputType = ROW({"c1", "c0"}, {BIGINT(), BIGINT()});
+  auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                  .startTableScan()
+                  .connectorId(kCudfHiveConnectorId)
+                  .tableHandle(makeTableHandle())
+                  .outputType(outputType)
+                  .columnAliases({{"c1", "c0"}, {"c0", "c1"}})
+                  .endTableScan()
+                  .capturePlanNodeId(scanId)
+                  .hashJoin(
+                      {"c1"},
+                      {"u_key"},
+                      buildSide,
+                      "",
+                      {"c1", "c0"},
+                      core::JoinType::kInner)
+                  .capturePlanNodeId(joinId)
+                  .planNode();
+  auto expected = makeRowVector(
+      {"c1", "c0"},
+      {makeFlatVector<int64_t>({1}), makeFlatVector<int64_t>({9})});
+  auto task = AssertQueryBuilder(plan)
+                  .config(CudfConfig::kCudfEnabled, "true")
+                  .maxDrivers(1)
+                  .splits(scanId, makeCudfHiveConnectorSplits({filePath}))
+                  .assertResults(expected);
+  const auto stats = toPlanStats(task->taskStats());
+  EXPECT_EQ(stats.at(joinId).customStats.at("dynamicFiltersProduced").sum, 1);
+  EXPECT_EQ(stats.at(scanId).customStats.at("dynamicFiltersAccepted").sum, 1);
+}
+
 TEST_F(TableScanTest, filterPushdown) {
   auto rowType =
       ROW({"c0", "c1", "c2", "c3"}, {TINYINT(), BIGINT(), DOUBLE(), BOOLEAN()});
