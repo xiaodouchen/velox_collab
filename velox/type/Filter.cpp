@@ -2419,6 +2419,9 @@ std::unique_ptr<Filter> BigintValuesUsingBloomFilter::mergeWith(
         if (testInt64(i)) {
           values.push_back(i);
         }
+        if (i == filter->upper()) {
+          break;
+        }
       }
       return createBigintValues(values, nullAllowed_ && other->testNull());
     }
@@ -2441,6 +2444,9 @@ std::unique_ptr<Filter> BigintValuesUsingBloomFilter::mergeWith(
       for (int64_t i = filter->min(); i <= filter->max(); ++i) {
         if (filter->testInt64(i) && testInt64(i)) {
           values.push_back(i);
+        }
+        if (i == filter->max()) {
+          break;
         }
       }
       return createBigintValues(values, nullAllowed_ && other->testNull());

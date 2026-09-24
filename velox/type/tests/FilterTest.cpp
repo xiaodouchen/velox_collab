@@ -803,6 +803,25 @@ TEST(FilterTest, bigintValuesUsingBloomFilterMergeWith) {
   }
 }
 
+TEST(FilterTest, bloomMergeAtInt64Max) {
+  constexpr auto kMax = std::numeric_limits<int64_t>::max();
+  BigintValuesUsingBloomFilter bloom(4, false);
+  bloom.insert(kMax);
+
+  for (int64_t lower : {kMax, kMax - 2}) {
+    BigintRange range(lower, kMax, false);
+    auto merged = bloom.mergeWith(&range);
+    ASSERT_TRUE(merged->testInt64(kMax));
+    EXPECT_TRUE(merged->testingEquals(*range.mergeWith(&bloom)));
+  }
+
+  std::vector<int64_t> values{kMax - 2, kMax};
+  BigintValuesUsingBitmask bitmask(values.front(), values.back(), values, false);
+  auto merged = bloom.mergeWith(&bitmask);
+  ASSERT_TRUE(merged->testInt64(kMax));
+  EXPECT_TRUE(merged->testingEquals(*bitmask.mergeWith(&bloom)));
+}
+
 TEST(FilterTest, bigintMultiRange) {
   // x between 1 and 10 or x between 100 and 120
   auto filter = bigintOr(between(1, 10), between(100, 120));
