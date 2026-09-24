@@ -452,7 +452,8 @@ void HashProbe::pushdownDynamicFilters() {
   //  * hash table has a single key with unique values,
   //  * build side has no dependent columns.
   if (keyChannels_.size() == 1 && !table_->hasDuplicateKeys() &&
-      tableOutputProjections_.empty() && !filter_ && numFilters > 0 &&
+      !isCountingJoin(joinType_) && tableOutputProjections_.empty() &&
+      !filter_ && numFilters > 0 &&
       !table_->hashers()[0]->getBloomFilter() && !isRightJoin(joinType_)) {
     canReplaceWithDynamicFilter_ = true;
   }
@@ -583,7 +584,7 @@ void HashProbe::asyncWaitForHashTable() {
        (isRightSemiProjectJoin(joinType_) && !nullAware_) ||
        isRightJoin(joinType_) || isRightAntiJoin(joinType_)) &&
       table_->hashMode() != BaseHashTable::HashMode::kHash && !isSpillInput() &&
-      operatorCtx_->driverCtx()
+      !nullAsValue_ && operatorCtx_->driverCtx()
           ->queryConfig()
           .hashProbeDynamicFilterPushdownEnabled() &&
       !hasMoreSpillData()) {

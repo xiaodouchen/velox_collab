@@ -1287,6 +1287,90 @@ TEST_F(TableScanTest, rejectsDynamicFiltersItCannotApply) {
   checkJoin(BIGINT(), true, "column type does not match dynamic filter type");
 }
 
+TEST_F(TableScanTest, countingSemiDynamicFilterKeepsCountsAndNulls) {
+  auto& config = CudfConfig::getInstance();
+  const auto previousFallback = config.allowCpuFallback;
+  unregisterCudf();
+  config.allowCpuFallback = true;
+  registerCudf();
+  SCOPE_EXIT {
+    unregisterCudf();
+    config.allowCpuFallback = previousFallback;
+    registerCudf();
+  };
+
+  auto runCase = [&](const RowVectorPtr& probe,
+                     const RowVectorPtr& build,
+                     const RowVectorPtr& expected,
+                     bool nullAsValue,
+                     bool expectDynamicFilter) {
+    auto filePath = TempFilePath::create();
+    writeToFile(filePath->getPath(), probe);
+    auto rowType = ROW("c0", BIGINT());
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto buildSide = PlanBuilder(planNodeIdGenerator, pool_.get())
+                         .values({build})
+                         .planNode();
+    core::PlanNodeId scanId;
+    core::PlanNodeId joinId;
+    auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                    .startTableScan()
+                    .connectorId(kCudfHiveConnectorId)
+                    .outputType(rowType)
+                    .dataColumns(rowType)
+                    .assignments(
+                        HiveConnectorTestBase::allRegularColumns(rowType))
+                    .endTableScan()
+                    .capturePlanNodeId(scanId)
+                    .hashJoin(
+                        {"c0"},
+                        {"u_key"},
+                        buildSide,
+                        "",
+                        {"c0"},
+                        core::JoinType::kCountingLeftSemiFilter,
+                        /*nullAware=*/false,
+                        /*nullAsValue=*/nullAsValue)
+                    .capturePlanNodeId(joinId)
+                    .planNode();
+    auto task = AssertQueryBuilder(plan)
+                    .config(CudfConfig::kCudfEnabled, "true")
+                    .maxDrivers(1)
+                    .splits(scanId, makeCudfHiveConnectorSplits({filePath}))
+                    .assertResults(expected);
+    const auto stats = toPlanStats(task->taskStats());
+    EXPECT_TRUE(stats.at(joinId).operatorStats.count("HashProbe"));
+    if (expectDynamicFilter) {
+      EXPECT_EQ(
+          stats.at(scanId).customStats.at("dynamicFiltersAccepted").sum, 1);
+    } else {
+      EXPECT_TRUE(stats.at(scanId).dynamicFilterStats.producerNodeIds.empty());
+    }
+  };
+
+  runCase(
+      makeRowVector(
+          {"c0"}, {makeNullableFlatVector<int64_t>({1, 1})}),
+      makeRowVector(
+          {"u_key"}, {makeNullableFlatVector<int64_t>({1})}),
+      makeRowVector(
+          {"c0"}, {makeNullableFlatVector<int64_t>({1})}),
+      false,
+      true);
+  runCase(
+      makeRowVector(
+          {"c0"},
+          {makeNullableFlatVector<int64_t>({std::nullopt, 1})}),
+      makeRowVector(
+          {"u_key"},
+          {makeNullableFlatVector<int64_t>({std::nullopt, 1})}),
+      makeRowVector(
+          {"c0"},
+          {makeNullableFlatVector<int64_t>({std::nullopt, 1})}),
+      true,
+      false);
+}
+
 TEST_F(TableScanTest, disjointDynamicFiltersProduceNoRows) {
   auto rowType = ROW("c0", BIGINT());
   auto probe = makeRowVector(
