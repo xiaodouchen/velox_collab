@@ -2479,6 +2479,7 @@ exec::BlockingReason CudfHashJoinProbe::isBlocked(ContinueFuture* future) {
     }
     return exec::BlockingReason::kWaitForJoinBuild;
   }
+  ensureCudaContextForThread();
   hashObject_ = std::move(hashObject);
   buildStream_ = cudfJoinBridge->getBuildStream();
   buildReadyEvent_ = cudfJoinBridge->getBuildReadyEvent();
