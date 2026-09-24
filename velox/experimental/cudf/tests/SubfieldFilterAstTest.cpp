@@ -283,6 +283,25 @@ TEST_F(SubfieldFilterAstTest, negatedNarrowIntegerValues) {
       common::FilterKind::kNegatedBigintValuesUsingHashTable);
 }
 
+TEST_F(SubfieldFilterAstTest, negatedNarrowIntegerOutOfRange) {
+  auto rowType = ROW("c0", TINYINT());
+  auto rows = makeRowVector(
+      {"c0"},
+      {makeNullableFlatVector<int8_t>({-128, 0, 127, std::nullopt})});
+  for (const auto& rejected : std::vector<std::vector<int64_t>>{
+           {128, 129}, {-130, -129}, {-129, -128}, {127, 128}, {128},
+           {-129}}) {
+    auto filter = common::createNegatedBigintValues(rejected, false);
+    ASSERT_EQ(filter->kind(), common::FilterKind::kNegatedBigintRange);
+    common::Subfield subfield("c0");
+    cudf::ast::tree tree;
+    std::vector<std::unique_ptr<cudf::scalar>> scalars;
+    const auto& expr = createAstFromSubfieldFilter(
+        subfield, *filter, tree, scalars, rowType);
+    testFilterExecution(rowType, "c0", *filter, rows, expr);
+  }
+}
+
 TEST_F(SubfieldFilterAstTest, doubleRange) {
   const std::string columnName = "c1";
   auto rowType = ROW({{columnName, DOUBLE()}});

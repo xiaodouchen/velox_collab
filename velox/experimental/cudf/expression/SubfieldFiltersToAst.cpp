@@ -152,12 +152,13 @@ std::reference_wrapper<const cudf::ast::expression> buildIntegerRangeExpr(
       return tree.push(literal);
     };
 
+    if (upper < minBound || lower > maxBound) {
+      // The entire range is outside the column type's domain.
+      return tree.push(Operation{Op::NOT_EQUAL, columnRef, columnRef});
+    }
+
     if (lower == upper) {
       // Equal comparison: column = value.
-      if (lower < minBound || lower > maxBound) {
-        // Value is outside the representable range of NativeT, always false.
-        return tree.push(Operation{Op::NOT_EQUAL, columnRef, columnRef});
-      }
       auto const& literal = addLiteral(lower);
       return tree.push(Operation{Op::EQUAL, columnRef, literal});
     }
