@@ -1252,7 +1252,7 @@ TEST_F(TableScanTest, rejectsDynamicFiltersItCannotApply) {
                         useGpuJoin ? core::JoinType::kInner
                                    : core::JoinType::kCountingLeftSemiFilter,
                         /*nullAware=*/false,
-                        /*nullAsValue=*/!useGpuJoin)
+                        /*nullAsValue=*/false)
                     .capturePlanNodeId(joinId)
                     .planNode();
 
@@ -1285,6 +1285,146 @@ TEST_F(TableScanTest, rejectsDynamicFiltersItCannotApply) {
     checkJoin(DECIMAL(18, 2), false, nullptr);
   }
   checkJoin(BIGINT(), true, "column type does not match dynamic filter type");
+}
+
+TEST_F(TableScanTest, rightAntiDynamicFilterKeepsBuildMatches) {
+  auto& config = CudfConfig::getInstance();
+  const auto previousFallback = config.allowCpuFallback;
+  unregisterCudf();
+  config.allowCpuFallback = true;
+  registerCudf();
+  SCOPE_EXIT {
+    unregisterCudf();
+    config.allowCpuFallback = previousFallback;
+    registerCudf();
+  };
+
+  auto probe = makeRowVector({"c0"}, {makeFlatVector<int64_t>({1})});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), probe);
+  auto rowType = ROW("c0", BIGINT());
+  for (const auto& [buildValues, expectedCount] :
+       std::vector<std::pair<std::vector<int64_t>, int64_t>>{
+           {{1}, 0}, {{1, 2}, 1}}) {
+    auto build = makeRowVector(
+        {"u_key"}, {makeFlatVector<int64_t>(buildValues)});
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    auto buildSide = PlanBuilder(planNodeIdGenerator, pool_.get())
+                         .values({build})
+                         .planNode();
+    core::PlanNodeId scanId;
+    core::PlanNodeId joinId;
+    auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                    .startTableScan()
+                    .connectorId(kCudfHiveConnectorId)
+                    .outputType(rowType)
+                    .dataColumns(rowType)
+                    .assignments(
+                        HiveConnectorTestBase::allRegularColumns(rowType))
+                    .endTableScan()
+                    .capturePlanNodeId(scanId)
+                    .hashJoin(
+                        {"c0"},
+                        {"u_key"},
+                        buildSide,
+                        "",
+                        {},
+                        core::JoinType::kRightAnti,
+                        /*nullAware=*/false,
+                        /*nullAsValue=*/false)
+                    .capturePlanNodeId(joinId)
+                    .singleAggregation({}, {"count(1)"})
+                    .planNode();
+    auto expected = makeRowVector(
+        {"a0"}, {makeFlatVector<int64_t>({expectedCount})});
+    auto task = AssertQueryBuilder(plan)
+                    .config(CudfConfig::kCudfEnabled, "true")
+                    .maxDrivers(1)
+                    .splits(scanId, makeCudfHiveConnectorSplits({filePath}))
+                    .assertResults(expected);
+    const auto stats = toPlanStats(task->taskStats());
+    EXPECT_TRUE(stats.at(joinId).operatorStats.count("HashProbe"));
+    EXPECT_EQ(stats.at(scanId).customStats.at("dynamicFiltersAccepted").sum, 1);
+  }
+}
+
+TEST_F(TableScanTest, countingAntiPayloadFilterDoesNotChangeSelectedRow) {
+  auto& config = CudfConfig::getInstance();
+  const auto previousFallback = config.allowCpuFallback;
+  unregisterCudf();
+  config.allowCpuFallback = true;
+  registerCudf();
+  SCOPE_EXIT {
+    unregisterCudf();
+    config.allowCpuFallback = previousFallback;
+    registerCudf();
+  };
+
+  auto probe = makeRowVector(
+      {"k", "p"},
+      {makeFlatVector<int64_t>({1, 1}),
+       makeFlatVector<int64_t>({10, 20})});
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), probe);
+  auto rowType = ROW({"k", "p"}, {BIGINT(), BIGINT()});
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto antiBuild = PlanBuilder(planNodeIdGenerator, pool_.get())
+                       .values({makeRowVector(
+                           {"u_k"}, {makeFlatVector<int64_t>({1})})})
+                       .planNode();
+  auto semiBuild = PlanBuilder(planNodeIdGenerator, pool_.get())
+                       .values({makeRowVector(
+                           {"u_p"}, {makeFlatVector<int64_t>({20})})})
+                       .planNode();
+  core::PlanNodeId scanId;
+  core::PlanNodeId antiId;
+  core::PlanNodeId semiId;
+  auto plan = PlanBuilder(planNodeIdGenerator, pool_.get())
+                  .startTableScan()
+                  .connectorId(kCudfHiveConnectorId)
+                  .outputType(rowType)
+                  .dataColumns(rowType)
+                  .assignments(
+                      HiveConnectorTestBase::allRegularColumns(rowType))
+                  .endTableScan()
+                  .capturePlanNodeId(scanId)
+                  .hashJoin(
+                      {"k"},
+                      {"u_k"},
+                      antiBuild,
+                      "",
+                      {"k", "p"},
+                      core::JoinType::kCountingAnti,
+                      /*nullAware=*/false,
+                      /*nullAsValue=*/false)
+                  .capturePlanNodeId(antiId)
+                  .hashJoin(
+                      {"p"},
+                      {"u_p"},
+                      semiBuild,
+                      "",
+                      {"k", "p"},
+                      core::JoinType::kCountingLeftSemiFilter,
+                      /*nullAware=*/false,
+                      /*nullAsValue=*/false)
+                  .capturePlanNodeId(semiId)
+                  .planNode();
+  auto expected = makeRowVector(
+      {"k", "p"},
+      {makeFlatVector<int64_t>({1}), makeFlatVector<int64_t>({20})});
+  for (bool pushdown : {false, true}) {
+    auto task = AssertQueryBuilder(plan)
+                    .config(CudfConfig::kCudfEnabled, "true")
+                    .config(
+                        core::QueryConfig::kHashProbeDynamicFilterPushdownEnabled,
+                        pushdown ? "true" : "false")
+                    .maxDrivers(1)
+                    .splits(scanId, makeCudfHiveConnectorSplits({filePath}))
+                    .assertResults(expected);
+    const auto stats = toPlanStats(task->taskStats());
+    EXPECT_TRUE(stats.at(antiId).operatorStats.count("HashProbe"));
+    EXPECT_TRUE(stats.at(semiId).operatorStats.count("HashProbe"));
+  }
 }
 
 TEST_F(TableScanTest, countingSemiDynamicFilterKeepsCountsAndNulls) {

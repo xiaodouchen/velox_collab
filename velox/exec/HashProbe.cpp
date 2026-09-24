@@ -15,6 +15,8 @@
  */
 
 #include "velox/exec/HashProbe.h"
+
+#include <algorithm>
 #include <folly/ScopeGuard.h>
 #include "velox/common/base/Counters.h"
 #include "velox/common/base/StatsReporter.h"
@@ -197,7 +199,12 @@ void HashProbe::initialize() {
     }
     projectedInputColumns_[i] = *outIndex;
     if (!isRightJoin(joinType_) && !isFullJoin(joinType_)) {
-      identityProjections_.emplace_back(i, *outIndex);
+      // A payload filter before a counting join can change which row survives.
+      if (!isCountingJoin(joinType_) ||
+          std::find(keyChannels_.begin(), keyChannels_.end(), i) !=
+              keyChannels_.end()) {
+        identityProjections_.emplace_back(i, *outIndex);
+      }
       if (*outIndex == i) {
         ++numIdentityProjections;
       }
@@ -451,10 +458,10 @@ void HashProbe::pushdownDynamicFilters() {
   // following conditions are met:
   //  * hash table has a single key with unique values,
   //  * build side has no dependent columns.
-  if (keyChannels_.size() == 1 && !table_->hasDuplicateKeys() &&
-      !isCountingJoin(joinType_) && tableOutputProjections_.empty() &&
-      !filter_ && numFilters > 0 &&
-      !table_->hashers()[0]->getBloomFilter() && !isRightJoin(joinType_)) {
+  if ((isInnerJoin(joinType_) || isLeftSemiFilterJoin(joinType_)) &&
+      keyChannels_.size() == 1 && !table_->hasDuplicateKeys() &&
+      tableOutputProjections_.empty() && !filter_ && numFilters > 0 &&
+      !table_->hashers()[0]->getBloomFilter()) {
     canReplaceWithDynamicFilter_ = true;
   }
 }
