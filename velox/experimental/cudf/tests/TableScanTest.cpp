@@ -62,6 +62,8 @@
 
 #include <rmm/device_buffer.hpp>
 
+#include <cuda_runtime_api.h>
+
 #include <fmt/ranges.h>
 #include <folly/ScopeGuard.h>
 #include <folly/synchronization/Baton.h>
@@ -656,6 +658,31 @@ TEST_F(TableScanTest, directBufferInputRawInputBytes) {
   assertStorageReadStats(runtimeStats, filePath->fileSize());
   ASSERT_GT(runtimeStats.at("totalScanTime").sum, 0);
   ASSERT_GT(runtimeStats.at("ioWaitWallNanos").sum, 0);
+}
+
+TEST_F(TableScanTest, scanOnNonDefaultGpu) {
+  int deviceCount = 0;
+  ASSERT_EQ(cudaSuccess, cudaGetDeviceCount(&deviceCount));
+  if (deviceCount < 2) {
+    GTEST_SKIP() << "Requires two GPUs";
+  }
+
+  int originalDevice = -1;
+  ASSERT_EQ(cudaSuccess, cudaGetDevice(&originalDevice));
+  unregisterCudf();
+  SCOPE_EXIT {
+    unregisterCudf();
+    cudaSetDevice(originalDevice);
+    registerCudf();
+  };
+  ASSERT_EQ(cudaSuccess, cudaSetDevice(1));
+  registerCudf();
+
+  auto vectors = makeVectors(1, 1'000);
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vectors);
+  createDuckDbTable(vectors);
+  assertQuery(tableScanNode(), {filePath}, "SELECT * FROM tmp");
 }
 
 TEST_F(TableScanTest, columnAliases) {
