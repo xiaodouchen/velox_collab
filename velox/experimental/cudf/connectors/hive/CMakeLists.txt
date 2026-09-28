@@ -15,12 +15,15 @@
 add_library(
   velox_cudf_hive_connector
   BufferedInputDataSource.cpp
+  CudfDynamicFilter.h
   CudfHiveConfig.cpp
   CudfHiveConnector.cpp
   CudfHiveConnectorSplit.cpp
   CudfHiveDataSink.cpp
   CudfHiveDataSource.cpp
   CudfHiveTableHandle.cpp
+  CudfIntegerMembership.cu
+  CudfIntegerMembership.h
   CudfSplitReader.cpp
   CudfSplitReaderByteFetch.cpp
 )
