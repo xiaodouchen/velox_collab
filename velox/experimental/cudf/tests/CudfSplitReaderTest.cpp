@@ -103,7 +103,8 @@ TEST_F(CudfSplitReaderTest, buildsPushdownFilterForEachSplitPreparation) {
       std::make_shared<CudfHiveConfig>(properties),
       std::make_shared<io::IoStatistics>(),
       std::make_shared<IoStats>(),
-      &logicalFilter);
+      &logicalFilter,
+      nullptr);
 
   EXPECT_EQ(reader.logicalFilter(), &logicalFilter);
   EXPECT_EQ(reader.splitFilter(), &logicalFilter);
