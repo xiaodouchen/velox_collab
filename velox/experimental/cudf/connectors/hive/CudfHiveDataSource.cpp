@@ -25,6 +25,7 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/SubfieldFiltersToAst.h"
+#include "velox/experimental/cudf/filter/CudfSplitBlockBloomFilter.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/common/Casts.h"
@@ -324,6 +325,8 @@ void CudfHiveDataSource::addDynamicFilter(
   const bool isIntegerValues =
       kind == common::FilterKind::kBigintValuesUsingHashTable ||
       kind == common::FilterKind::kBigintValuesUsingBitmask;
+  const bool isBloom =
+      kind == common::FilterKind::kBigintValuesUsingBloomFilter;
   auto field = common::Subfield::create(readColumnNames_[outputChannel]);
 
   if (!isSupportedInteger) {
@@ -347,15 +350,28 @@ void CudfHiveDataSource::addDynamicFilter(
     dynamicIntegerFilters_.insert_or_assign(
         outputChannel,
         DynamicIntegerFilter{std::move(values), filter->testNull(), nullptr});
+    dynamicBloomFilters_.erase(outputChannel);
+    dynamicFilters_.erase(*field);
+  } else if (isBloom) {
+    auto bloom =
+        std::dynamic_pointer_cast<common::BigintValuesUsingBloomFilter>(filter);
+    VELOX_CHECK_NOT_NULL(bloom);
+    dynamicIntegerFilters_.erase(outputChannel);
+    dynamicBloomFilters_.insert_or_assign(
+        outputChannel, DynamicBloomFilter{std::move(bloom), nullptr});
     dynamicFilters_.erase(*field);
   } else if (
       kind == common::FilterKind::kBigintRange ||
       kind == common::FilterKind::kBigintMultiRange ||
       kind == common::FilterKind::kMultiRange ||
+      kind == common::FilterKind::kNegatedBigintRange ||
+      kind == common::FilterKind::kNegatedBigintValuesUsingHashTable ||
+      kind == common::FilterKind::kNegatedBigintValuesUsingBitmask ||
       kind == common::FilterKind::kIsNull ||
       kind == common::FilterKind::kIsNotNull ||
       kind == common::FilterKind::kAlwaysFalse) {
     dynamicIntegerFilters_.erase(outputChannel);
+    dynamicBloomFilters_.erase(outputChannel);
     dynamicFilters_.insert_or_assign(field->clone(), filter->clone());
   } else {
     VELOX_UNSUPPORTED(
@@ -455,6 +471,33 @@ std::optional<RowVectorPtr> CudfHiveDataSource::next(
           *cudfTable, mask->view(), stream, get_output_mr());
     }
 
+    for (auto& [channel, dynamicFilter] : dynamicBloomFilters_) {
+      if (cudfTable->num_rows() == 0) {
+        break;
+      }
+      auto inputColumn = cudfTable->view().column(channel);
+      const auto blocks = dynamicFilter.filter->blocks();
+      if (!dynamicFilter.deviceBlocks) {
+        dynamicFilter.deviceBlocks = std::make_unique<rmm::device_buffer>(
+            dynamicFilter.filter->blocksByteSize(), stream, get_temp_mr());
+        CUDF_CUDA_TRY(cudaMemcpyAsync(
+            dynamicFilter.deviceBlocks->data(),
+            blocks.data(),
+            dynamicFilter.filter->blocksByteSize(),
+            cudaMemcpyHostToDevice,
+            stream.get()));
+      }
+      auto mask = makeSplitBlockBloomFilterMask(
+          inputColumn,
+          static_cast<const uint32_t*>(dynamicFilter.deviceBlocks->data()),
+          blocks.size(),
+          sizeof(SplitBlockBloomFilter::Block) / sizeof(uint32_t),
+          dynamicFilter.filter->testNull(),
+          stream,
+          get_temp_mr());
+      cudfTable = cudf::apply_retention_mask(
+          *cudfTable, mask->view(), stream, get_output_mr());
+    }
   }
 
   uint64_t filterTimeUs{0};

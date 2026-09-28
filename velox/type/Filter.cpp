@@ -419,6 +419,15 @@ std::unique_ptr<Filter> BigintValuesUsingBloomFilter::create(
       new BigintValuesUsingBloomFilter(nullAllowed, std::move(blocks)));
 }
 
+std::unique_ptr<BigintValuesUsingBloomFilter>
+BigintValuesUsingBloomFilter::createFromBlocks(
+    std::vector<SplitBlockBloomFilter::Block> blocks,
+    bool nullAllowed) {
+  VELOX_CHECK(!blocks.empty(), "Bloom filter must contain at least one block");
+  return std::unique_ptr<BigintValuesUsingBloomFilter>(
+      new BigintValuesUsingBloomFilter(nullAllowed, std::move(blocks)));
+}
+
 bool BigintValuesUsingBloomFilter::testingEquals(const Filter& other) const {
   auto* typedOther =
       Filter::testingBaseEquals<BigintValuesUsingBloomFilter>(other);
@@ -2410,6 +2419,9 @@ std::unique_ptr<Filter> BigintValuesUsingBloomFilter::mergeWith(
         if (testInt64(i)) {
           values.push_back(i);
         }
+        if (i == filter->upper()) {
+          break;
+        }
       }
       return createBigintValues(values, nullAllowed_ && other->testNull());
     }
@@ -2432,6 +2444,9 @@ std::unique_ptr<Filter> BigintValuesUsingBloomFilter::mergeWith(
       for (int64_t i = filter->min(); i <= filter->max(); ++i) {
         if (filter->testInt64(i) && testInt64(i)) {
           values.push_back(i);
+        }
+        if (i == filter->max()) {
+          break;
         }
       }
       return createBigintValues(values, nullAllowed_ && other->testNull());
