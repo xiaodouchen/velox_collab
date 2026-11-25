@@ -34,10 +34,12 @@
 #include "velox/functions/prestosql/window/WindowFunctionsRegistration.h"
 #include "velox/parse/TypeResolver.h"
 #include "velox/serializers/PrestoSerializer.h"
+#include "velox/type/DecimalUtil.h"
 #include "velox/type/Type.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 #include <fmt/format.h>
+#include <folly/ScopeGuard.h>
 #include <folly/String.h>
 #include <gtest/gtest.h>
 
@@ -2654,6 +2656,98 @@ TEST_F(CudfWindowTest, decimalSumWidensBeforeWindowAggregation) {
       "sum(d) over (partition by p order by ord "
       "rows between unbounded preceding and current row) as s",
       runningSums);
+}
+
+TEST_F(CudfWindowTest, fullPartitionDecimalSumRejectsOverflow) {
+  const auto max = DecimalUtil::kLongDecimalMax;
+  for (const auto& [description, magnitude] :
+       {std::pair{"int128 overflow", max},
+        std::pair{"result precision overflow", max / 2 + 1}}) {
+    SCOPED_TRACE(description);
+    for (const auto value : {magnitude, -magnitude}) {
+      // Three max-magnitude values wrap back into the DECIMAL(38, 0) range.
+      // A result precision check alone would therefore miss that overflow.
+      auto data = makeRowVector(
+          {"p", "d"},
+          {
+              makeFlatVector<int32_t>({1, 1, 1, 2}),
+              makeFlatVector<int128_t>(
+                  {value, value, value, 0}, DECIMAL(38, 0)),
+          });
+      for (const auto* window : {"", "partition by p"}) {
+        SCOPED_TRACE(window);
+        auto plan = PlanBuilder()
+                        .values({data})
+                        .window({fmt::format("sum(d) over ({}) as s", window)})
+                        .planNode();
+        const auto run = [&] {
+          return AssertQueryBuilder(plan).copyResults(pool());
+        };
+        // The fixture disables CPU fallback so this must be an error from GPU.
+        VELOX_ASSERT_THROW(run(), "Decimal overflow");
+        cudf_velox::unregisterCudf();
+        SCOPE_EXIT {
+          cudf_velox::registerCudf();
+        };
+        VELOX_ASSERT_THROW(run(), "Decimal overflow");
+      }
+    }
+  }
+}
+
+TEST_F(CudfWindowTest, fullPartitionDecimalSumWithCancellationAndNulls) {
+  const auto max = DecimalUtil::kLongDecimalMax;
+  auto data = makeRowVector(
+      {"p", "ord", "d"},
+      {
+          makeNullableFlatVector<int32_t>({1, 2, 1, std::nullopt, 1, 1}),
+          makeFlatVector<int32_t>({0, 1, 2, 3, 4, 5}),
+          makeNullableFlatVector<int128_t>(
+              {max, std::nullopt, max, 0, -max, std::nullopt}, DECIMAL(38, 0)),
+      });
+  for (const auto* expression :
+       {"sum(d) over () as s",
+        "sum(d) over (order by ord rows between unbounded preceding "
+        "and unbounded following) as s",
+        "sum(d) over (partition by p) as s",
+        "sum(d) over (partition by p order by ord desc range between "
+        "unbounded preceding and unbounded following) as s"}) {
+    SCOPED_TRACE(expression);
+    assertCpuAndGpuResults(
+        PlanBuilder().values({data}).window({expression}).planNode());
+  }
+
+  auto allNull = makeRowVector(
+      {"d"},
+      {makeNullableFlatVector<int128_t>(
+          {std::nullopt, std::nullopt}, DECIMAL(38, 0))});
+  assertCpuAndGpuResults(
+      PlanBuilder().values({allNull}).window({"sum(d) over ()"}).planNode());
+}
+
+TEST_F(CudfWindowTest, nonFullPartitionHighPrecisionDecimalSumFallsBack) {
+  auto data = makeRowVector(
+      {"ord", "d"},
+      {
+          makeFlatVector<int32_t>({1, 2}),
+          makeFlatVector<int128_t>({10, 20}, DECIMAL(29, 0)),
+      });
+  auto expected = makeRowVector(
+      {"ord", "d", "s"},
+      {data->childAt(0),
+       data->childAt(1),
+       makeFlatVector<int128_t>({10, 30}, DECIMAL(38, 0))});
+  for (const auto* frame :
+       {"order by ord",
+        "order by ord rows between 1 preceding and current row"}) {
+    SCOPED_TRACE(frame);
+    auto plan = PlanBuilder()
+                    .values({data})
+                    .window({fmt::format("sum(d) over ({}) as s", frame)})
+                    .planNode();
+    assertWindowRejected(plan, "DECIMAL window SUM may overflow");
+    assertCpuWindowFallback(plan, expected);
+  }
 }
 
 // A cast on a window function argument (e.g. sum(cast(v as bigint))) reaches

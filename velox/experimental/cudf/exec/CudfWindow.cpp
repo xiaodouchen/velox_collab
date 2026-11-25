@@ -25,6 +25,7 @@
 #include "velox/common/base/Exceptions.h"
 #include "velox/core/Expressions.h"
 #include "velox/exec/Operator.h"
+#include "velox/type/DecimalUtil.h"
 #include "velox/type/Type.h"
 
 #include <cudf/aggregation.hpp>
@@ -39,6 +40,7 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/structs/structs_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
@@ -95,6 +97,15 @@ bool isFullPartitionFrame(
   return isUnboundedPreceding &&
       (isUnboundedFollowing ||
        (isRange && isCurrentRowFollowing && !hasSortKeys));
+}
+
+bool needsDecimalWindowSumCheck(const Type& inputType, const Type& resultType) {
+  // All window rows fit in one cuDF column. With matching scales, this
+  // bounds the number of extra decimal digits needed for any frame's sum.
+  constexpr int kMaxExtraDigits =
+      std::numeric_limits<cudf::size_type>::digits10 + 1;
+  return getDecimalPrecisionScale(inputType).first + kMaxExtraDigits >
+      getDecimalPrecisionScale(resultType).first;
 }
 
 std::optional<std::pair<cudf::range_window_type, cudf::range_window_type>>
@@ -242,12 +253,12 @@ std::unique_ptr<cudf::column> computeGlobalAggregate(
   return cudf::make_column_from_scalar(*resultScalar, numRows, stream, mr);
 }
 
-// Compute each partition's average once, then copy it back to every row.
-std::unique_ptr<cudf::column> computeFullPartitionAverage(
+// Return the aggregate and the row count for each partition, in input order.
+cudf::groupby::aggregation_result computeFullPartitionAggregate(
     const cudf::table_view& partitionKeys,
     cudf::column_view input,
-    cuda::stream_ref stream,
-    rmm::device_async_resource_ref mr) {
+    std::unique_ptr<cudf::groupby_aggregation> aggregation,
+    cuda::stream_ref stream) {
   cudf::groupby::groupby grouper(
       partitionKeys,
       cudf::null_policy::INCLUDE,
@@ -258,23 +269,107 @@ std::unique_ptr<cudf::column> computeFullPartitionAverage(
           partitionKeys.num_columns(), cudf::null_order::BEFORE));
   std::vector<cudf::groupby::aggregation_request> requests(1);
   requests[0].values = input;
-  requests[0].aggregations.push_back(
-      cudf::make_mean_aggregation<cudf::groupby_aggregation>());
+  requests[0].aggregations.push_back(std::move(aggregation));
   requests[0].aggregations.push_back(
       cudf::make_count_aggregation<cudf::groupby_aggregation>(
           cudf::null_policy::INCLUDE));
-  auto [keys, results] = grouper.aggregate(requests, stream, get_temp_mr());
+  auto result = grouper.aggregate(requests, stream, get_temp_mr());
+  return std::move(result.second.front());
+}
 
+std::unique_ptr<cudf::column> computeFullPartitionAverage(
+    const cudf::table_view& partitionKeys,
+    cudf::column_view input,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  auto aggregates = computeFullPartitionAggregate(
+      partitionKeys,
+      input,
+      cudf::make_mean_aggregation<cudf::groupby_aggregation>(),
+      stream);
   // The presorted groupby returns groups in partition order. Repeat each mean
   // for every row in its partition, including rows whose AVG input is null.
   auto result = cudf::repeat(
-      cudf::table_view{{results[0].results[0]->view()}},
-      results[0].results[1]->view(),
+      cudf::table_view{{aggregates.results[0]->view()}},
+      aggregates.results[1]->view(),
       stream,
       mr);
   // RMM deallocates results' buffers on this stream after repeat() finishes
   // reading the mean and count columns.
   return std::move(result->release()[0]);
+}
+
+void checkDecimalWindowSums(
+    cudf::column_view sums,
+    cudf::column_view overflowFlags,
+    uint8_t precision,
+    cuda::stream_ref stream) {
+  if (sums.size() == sums.null_count()) {
+    return;
+  }
+
+  auto tempMr = get_temp_mr();
+  auto any = cudf::make_any_aggregation<cudf::reduce_aggregation>();
+  auto overflow = cudf::reduce(
+      overflowFlags,
+      *any,
+      cudf::data_type{cudf::type_id::BOOL8},
+      stream,
+      tempMr);
+  const auto& flag = static_cast<const cudf::numeric_scalar<bool>&>(*overflow);
+  VELOX_USER_CHECK(!flag.value(stream), "Decimal overflow");
+
+  // A sum can fit in DECIMAL128 storage but exceed the SQL result precision.
+  auto [minimum, maximum] = cudf::minmax(sums, stream, tempMr);
+  using DecimalScalar = cudf::fixed_point_scalar<numeric::decimal128>;
+  VELOX_USER_CHECK(
+      DecimalUtil::valueInPrecisionRange(
+          static_cast<const DecimalScalar&>(*minimum).value(stream),
+          precision) &&
+          DecimalUtil::valueInPrecisionRange(
+              static_cast<const DecimalScalar&>(*maximum).value(stream),
+              precision),
+      "Decimal overflow");
+}
+
+std::unique_ptr<cudf::column> computeFullPartitionDecimalSum(
+    const cudf::table_view& partitionKeys,
+    cudf::column_view input,
+    uint8_t precision,
+    cuda::stream_ref stream,
+    rmm::device_async_resource_ref mr) {
+  if (input.is_empty()) {
+    return cudf::empty_like(input);
+  }
+
+  if (partitionKeys.num_columns() == 0) {
+    auto agg = cudf::make_sum_overflow_aggregation<cudf::reduce_aggregation>();
+    auto scalar = cudf::reduce(
+        input,
+        *agg,
+        cudf::data_type{cudf::type_id::STRUCT},
+        stream,
+        get_temp_mr());
+    auto children = static_cast<const cudf::struct_scalar&>(*scalar).view();
+    auto sums = children.column(0);
+    checkDecimalWindowSums(sums, children.column(1), precision, stream);
+    auto repeated =
+        cudf::repeat(cudf::table_view{{sums}}, input.size(), stream, mr);
+    return std::move(repeated->release().front());
+  }
+
+  auto aggregates = computeFullPartitionAggregate(
+      partitionKeys,
+      input,
+      cudf::make_sum_overflow_aggregation<cudf::groupby_aggregation>(),
+      stream);
+  auto checkedSums = cudf::structs_column_view{aggregates.results[0]->view()};
+  auto sums = checkedSums.get_sliced_child(0, stream);
+  checkDecimalWindowSums(
+      sums, checkedSums.get_sliced_child(1, stream), precision, stream);
+  auto repeated = cudf::repeat(
+      cudf::table_view{{sums}}, aggregates.results[1]->view(), stream, mr);
+  return std::move(repeated->release().front());
 }
 
 bool containsCustomComparison(const TypePtr& type) {
@@ -638,6 +733,8 @@ bool CudfWindow::canRunOnGPU(
       }
     }
 
+    const bool isFullPartition =
+        isFullPartitionFrame(func, !windowNode.sortingKeys().empty());
     if (!func.functionCall->inputs().empty()) {
       const auto& argumentType = func.functionCall->inputs()[0]->type();
 
@@ -661,10 +758,29 @@ bool CudfWindow::canRunOnGPU(
         }
         return false;
       }
+
+      if (baseName == "sum" && argumentType->isDecimal()) {
+        const auto& resultType = func.functionCall->type();
+        if (!resultType->isDecimal() ||
+            getDecimalPrecisionScale(*argumentType).second !=
+                getDecimalPrecisionScale(*resultType).second) {
+          if (reason) {
+            *reason =
+                "DECIMAL window SUM requires a DECIMAL result with matching scale";
+          }
+          return false;
+        }
+        if (!isFullPartition &&
+            needsDecimalWindowSumCheck(*argumentType, *resultType)) {
+          if (reason) {
+            *reason =
+                "DECIMAL window SUM may overflow for a non-full-partition frame";
+          }
+          return false;
+        }
+      }
     }
 
-    const bool isFullPartition =
-        isFullPartitionFrame(func, !windowNode.sortingKeys().empty());
     // Full-partition AVG without partition keys uses the global reduction
     // path, which also supports integer and REAL inputs, even with ORDER BY.
     if (baseName == "avg" && isFullPartition &&
@@ -1248,14 +1364,29 @@ RowVectorPtr CudfWindow::doGetOutput() {
           ? makeCountStarInputColumn(
                 sortedView, logicalRowCount_, countStarColOwner, stream_, mr)
           : sortedView.column(*inputColIdx);
-      if (baseName == "sum" &&
-          func.functionCall->inputs()[0]->type()->isDecimal()) {
+      const bool isDecimalSum = baseName == "sum" &&
+          func.functionCall->inputs()[0]->type()->isDecimal();
+      if (isDecimalSum) {
         inputCol = castDecimal64InputToDecimal128(
             inputCol, decimalSumInputOwners[funcIndex], stream_);
       }
       const bool isFullPartition =
           isFullPartitionFrame(func, !sortKeyIndices_.empty());
-      if (isFullPartition && partKeys.num_columns() == 0 &&
+      if (isDecimalSum &&
+          needsDecimalWindowSumCheck(
+              *func.functionCall->inputs()[0]->type(),
+              *func.functionCall->type())) {
+        VELOX_CHECK(
+            isFullPartition,
+            "Checked DECIMAL window SUM requires a full partition");
+        windowResultCols[funcIndex] = computeFullPartitionDecimalSum(
+            partKeys,
+            inputCol,
+            getDecimalPrecisionScale(*func.functionCall->type()).first,
+            stream_,
+            mr);
+      } else if (
+          isFullPartition && partKeys.num_columns() == 0 &&
           (sortKeyIndices_.empty() || baseName == "avg")) {
         windowResultCols[funcIndex] = computeGlobalAggregate(
             inputCol,
